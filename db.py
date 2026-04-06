@@ -1,5 +1,4 @@
 from collections.abc import Generator
-from pathlib import Path
 
 from sqlalchemy import text
 from sqlmodel import Session, SQLModel, create_engine, select
@@ -11,15 +10,7 @@ _db_url = settings.database_url
 if _db_url.startswith("postgres://"):
     _db_url = _db_url.replace("postgres://", "postgresql://", 1)
 
-_is_sqlite = _db_url.startswith("sqlite")
-
-if _is_sqlite:
-    Path("backend/data").mkdir(parents=True, exist_ok=True)
-
-engine = create_engine(
-    _db_url,
-    connect_args={"check_same_thread": False} if _is_sqlite else {},
-)
+engine = create_engine(_db_url)
 
 DEFAULT_ADMIN_EMAIL = "liel@contra-adv.co.il"
 
