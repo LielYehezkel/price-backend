@@ -6,11 +6,19 @@ from sqlmodel import Session, SQLModel, create_engine, select
 
 from backend.config import settings
 
-Path("backend/data").mkdir(parents=True, exist_ok=True)
+# Normalise the URL: Render supplies postgres:// but SQLAlchemy requires postgresql://
+_db_url = settings.database_url
+if _db_url.startswith("postgres://"):
+    _db_url = _db_url.replace("postgres://", "postgresql://", 1)
+
+_is_sqlite = _db_url.startswith("sqlite")
+
+if _is_sqlite:
+    Path("backend/data").mkdir(parents=True, exist_ok=True)
 
 engine = create_engine(
-    settings.database_url,
-    connect_args={"check_same_thread": False},
+    _db_url,
+    connect_args={"check_same_thread": False} if _is_sqlite else {},
 )
 
 DEFAULT_ADMIN_EMAIL = "liel@contra-adv.co.il"

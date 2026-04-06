@@ -1,0 +1,12 @@
+fastapi
+uvicorn[standard]
+sqlmodel
+python-jose[cryptography]
+passlib[bcrypt]
+httpx
+beautifulsoup4
+APScheduler
+pydantic-settings
+psycopg2-binary
+email-validator
+curl_cffi
