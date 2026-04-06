@@ -10,5 +10,6 @@ pydantic-settings
 psycopg2-binary
 email-validator
 curl_cffi
+openpyxl
 
 
