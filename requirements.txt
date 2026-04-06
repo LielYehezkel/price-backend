@@ -11,5 +11,6 @@ psycopg2-binary
 email-validator
 curl_cffi
 openpyxl
+python-multipart
 
 
