@@ -3,6 +3,7 @@ uvicorn[standard]
 sqlmodel
 python-jose[cryptography]
 passlib[bcrypt]
+bcrypt<4.0.0
 httpx
 beautifulsoup4
 APScheduler
