@@ -8,11 +8,17 @@ from urllib.parse import urlparse
 
 from bs4 import BeautifulSoup, NavigableString, Tag
 
+# לא לכלול "widget" גולמי — Elementor משתמש ב־elementor-widget-* גם באזור המחיר הראשי
 FOOTER_HINTS = re.compile(
-    r"footer|related|cross-sell|upsell|widget|sidebar|comment|review|rating|ציון",
+    r"footer|related|cross-sell|upsell|widget-area|sidebar|comment|review|rating|ציון|"
+    r"elementor-loop|recently-viewed|compare-",
     re.I,
 )
 MAIN_HINTS = re.compile(r"price|product|money|amount|woocommerce|shopify|sale|מחיר", re.I)
+_LOOP_ANCESTOR = re.compile(
+    r"related|cross-sells|upsells|elementor-loop|products-related|yith-wcwl|compare-products",
+    re.I,
+)
 
 
 def normalize_domain(url: str) -> str:
@@ -168,16 +174,121 @@ def _element_raw_price_text(el: Tag) -> str:
     return el.get_text(" ", strip=True)
 
 
+def _is_inside_script_style(tag: Tag | None) -> bool:
+    p = tag
+    while p and isinstance(p, Tag):
+        if p.name in ("script", "style", "noscript"):
+            return True
+        p = p.parent
+    return False
+
+
+def _inside_wc_loop_product(el: Tag) -> bool:
+    """מחיר בתוך li.product ברשימת מוצרים (קשורים / גריד) — לא המוצר הראשי."""
+    li = el.find_parent("li")
+    if not li or not isinstance(li, Tag):
+        return False
+    lic = li.get("class") or []
+    if not isinstance(lic, list):
+        lic = [str(lic)]
+    if "product" not in lic:
+        return False
+    ul = li.find_parent("ul")
+    if not ul or not isinstance(ul, Tag):
+        return False
+    ucls = " ".join(ul.get("class") or []).lower()
+    return "products" in ucls
+
+
+def _woo_price_node_excluded(el: Tag) -> bool:
+    if _is_inside_script_style(el):
+        return True
+    if _inside_wc_loop_product(el):
+        return True
+    a: Tag | None = el.parent
+    while a and isinstance(a, Tag):
+        cls = " ".join(a.get("class") or []).strip()
+        aid = (a.get("id") or "").strip()
+        hay = f"{cls} {aid}"
+        if _LOOP_ANCESTOR.search(hay) or FOOTER_HINTS.search(hay):
+            return True
+        a = a.parent
+    return False
+
+
+def _main_woocommerce_context_score(el: Tag) -> float:
+    """ציון גבוה = סבירות גבוהה שזה מחיר המוצר הראשי בעמוד."""
+    s = 0.0
+    for a in el.parents:
+        if not isinstance(a, Tag):
+            continue
+        cls_l = " ".join(a.get("class") or []).lower()
+        if "elementor-widget-woocommerce-product-price" in cls_l:
+            s += 25.0
+        if "entry-summary" in cls_l:
+            s += 18.0
+        if "single-product" in cls_l:
+            s += 6.0
+        if a.name == "main" or (a.get("id") or "").lower() == "main":
+            s += 4.0
+        if "summary" in cls_l and "widget" not in cls_l:
+            s += 3.0
+        if any(
+            x in cls_l
+            for x in (
+                "mini-cart",
+                "widget_shopping_cart",
+                "cart-dropdown",
+                "header-cart",
+            )
+        ):
+            s -= 20.0
+    if el.find_parent("ins"):
+        s += 4.0
+    if el.find_parent("del"):
+        s -= 6.0
+    return s
+
+
+def _best_woocommerce_amount_node(soup: BeautifulSoup) -> Tag | None:
+    """בוחר את span.woocommerce-Price-amount המתאים למוצר הראשי (לא לולאה / קשורים)."""
+    best_sc = -1e9
+    best_el: Tag | None = None
+    for el in soup.select(".woocommerce-Price-amount"):
+        if not isinstance(el, Tag):
+            continue
+        if _woo_price_node_excluded(el):
+            continue
+        txt = _element_raw_price_text(el)
+        if not parse_price_number(txt):
+            continue
+        sc = _main_woocommerce_context_score(el)
+        if sc > best_sc:
+            best_sc = sc
+            best_el = el
+    return best_el
+
+
 _WOO_MAIN_SELECTORS = (
+    ".elementor-widget-woocommerce-product-price ins .woocommerce-Price-amount bdi",
+    ".elementor-widget-woocommerce-product-price ins .woocommerce-Price-amount",
+    ".elementor-widget-woocommerce-product-price .woocommerce-Price-amount bdi",
+    ".elementor-widget-woocommerce-product-price .woocommerce-Price-amount",
+    ".single-product .summary ins .woocommerce-Price-amount bdi",
+    ".single-product .summary ins .woocommerce-Price-amount",
     ".single-product .summary .woocommerce-Price-amount bdi",
     ".single-product .summary .woocommerce-Price-amount",
+    "main .product .summary ins .woocommerce-Price-amount bdi",
+    "main .product .summary .woocommerce-Price-amount bdi",
     "main .product .woocommerce-Price-amount bdi",
     "main .product .woocommerce-Price-amount",
+    "#primary .summary .woocommerce-Price-amount bdi",
+    "#primary .summary .woocommerce-Price-amount",
     "#primary .woocommerce-Price-amount bdi",
+    ".entry-summary ins .woocommerce-Price-amount bdi",
     ".entry-summary .woocommerce-Price-amount bdi",
-    ".woocommerce div.product .woocommerce-Price-amount bdi",
-    ".woocommerce-Price-amount bdi",
-    ".woocommerce-Price-amount",
+    ".woocommerce div.product .summary .woocommerce-Price-amount bdi",
+    ".woocommerce div.product div.summary .woocommerce-Price-amount bdi",
 )
 
 
@@ -185,9 +296,14 @@ def extract_woocommerce_amount(html: str) -> tuple[float | None, str | None, str
     soup = BeautifulSoup(html, "html.parser")
     for q in _WOO_MAIN_SELECTORS:
         sel = soup.select_one(q)
-        if not sel:
+        if not sel or _woo_price_node_excluded(sel):
             continue
         txt = _element_raw_price_text(sel)
+        if pn := parse_price_number(txt):
+            return pn, None, "woocommerce_class"
+    best_el = _best_woocommerce_amount_node(soup)
+    if best_el:
+        txt = _element_raw_price_text(best_el)
         if pn := parse_price_number(txt):
             return pn, None, "woocommerce_class"
     return None, None, "woocommerce_class"
@@ -255,6 +371,8 @@ def _score_element(el: Tag) -> float:
     combined = f"{cls} {el_id}"
     if FOOTER_HINTS.search(combined) or FOOTER_HINTS.search(text[:80]):
         score -= 4.0
+    if "elementor-widget-woocommerce-product-price" in combined:
+        score += 10.0
     if MAIN_HINTS.search(combined):
         score += 2.5
     # עדיפות לאזורי מוצר / מחיר מסחר
@@ -395,11 +513,25 @@ def collect_price_candidates(html: str, limit: int = 40) -> list[dict[str, Any]]
 
     _collect_attribute_price_candidates(soup, candidates, seen)
 
+    # מחירי Woo כמכלול — מונע תת־התאמות כמו "990" מתוך "1,990" ממילוי string=True
+    for amount in soup.select(".woocommerce-Price-amount"):
+        if not isinstance(amount, Tag):
+            continue
+        if _woo_price_node_excluded(amount):
+            continue
+        txt = _element_raw_price_text(amount)
+        if txt and parse_price_number(txt):
+            _push_candidate(candidates, seen, amount, txt, bonus=6.0)
+
     for el in soup.find_all(string=True):
         if not isinstance(el, NavigableString):
             continue
         parent = el.parent
         if not isinstance(parent, Tag):
+            continue
+        if _is_inside_script_style(parent):
+            continue
+        if parent.find_parent(class_=re.compile(r"woocommerce-Price-amount", re.I)):
             continue
         raw = str(el)
         if not raw.strip():
