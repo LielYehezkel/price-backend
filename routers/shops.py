@@ -1595,12 +1595,22 @@ def report_competitor_price_issue(
     domain = domain_from_url(c.url)
     if not domain:
         raise HTTPException(400, "כתובת לא תקינה")
-    html = fetch_html_sync(c.url)
-    result = run_extraction_pipeline(html)
-    price = result.get("price")
-    cur = result.get("currency")
-    candidates = result.get("candidates") or []
-    sug = candidates[0].get("selector") if candidates and isinstance(candidates[0], dict) else None
+    price: float | None = None
+    cur: str | None = None
+    candidates: list = []
+    sug: str | None = None
+    try:
+        html = fetch_html_sync(c.url)
+        result = run_extraction_pipeline(html)
+        price = result.get("price")
+        cur = result.get("currency")
+        candidates = result.get("candidates") or []
+        sug = candidates[0].get("selector") if candidates and isinstance(candidates[0], dict) else None
+    except Exception:
+        candidates = []
+        sug = None
+        price = None
+        cur = None
 
     if not domain_is_live(session, domain):
         dpa = session.get(DomainPriceApproval, domain)

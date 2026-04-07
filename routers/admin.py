@@ -2,6 +2,7 @@ import json
 from datetime import timedelta
 from typing import Annotated, Any
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, EmailStr
 from sqlalchemy import func, text
@@ -26,6 +27,23 @@ from backend.services.price_sanity import get_settings
 from backend.services.domain_policy import iter_competitor_ids_for_domain
 from backend.services.extract import run_extraction_pipeline, validate_selector_with_fallbacks
 from backend.services.fetch_html import fetch_html_sync
+
+
+def _safe_fetch_html_for_admin(url: str) -> str:
+    """לא מחזיר 500 פנימי על 403 — הודעת שגיאה קריאה לפרונט."""
+    try:
+        return fetch_html_sync(url)
+    except httpx.HTTPStatusError as e:
+        code = e.response.status_code if e.response is not None else "?"
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY,
+            f"האתר חסם את השרת (HTTP {code}). נסו שוב, או פתחו את הקישור ממחשב — לעיתים WAF חוסם כתובות דאטה-סנטר.",
+        ) from e
+    except httpx.HTTPError as e:
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY,
+            f"שגיאת רשת במשיכת הדף: {e!s}",
+        ) from e
 from backend.services.domain_queue_repair import repair_all_missing_domain_queue_items_global
 from backend.services.monitor_checks import run_competitor_check
 from backend.services.scan_engine_journal import compute_scan_engine_health, get_or_create_heartbeat
@@ -174,7 +192,7 @@ def _apply_extraction_to_pending_queue_item(session: Session, qi: DomainReviewQu
     if not url:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "אין כתובת לסריקה")
     domain = qi.domain.strip().lower()
-    html = fetch_html_sync(url)
+    html = _safe_fetch_html_for_admin(url)
     result = run_extraction_pipeline(html)
     price = result.get("price")
     cur = result.get("currency")
@@ -348,7 +366,7 @@ def rescan_domain_price_candidates(
     url = (dpa.sample_url or "").strip()
     if not url:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "אין דף דוגמה לדומיין — הוסיפו קישור מתחרה")
-    html = fetch_html_sync(url)
+    html = _safe_fetch_html_for_admin(url)
     result = run_extraction_pipeline(html)
     price = result.get("price")
     cur = result.get("currency")
@@ -402,7 +420,7 @@ def approve_domain_price_review(
 
     if not sample:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "אין כתובת דוגמה — הוסף קישור מתחרה והרץ סריקה")
-    html = fetch_html_sync(sample)
+    html = _safe_fetch_html_for_admin(sample)
     alts = body.selector_alternates or []
     price, used = validate_selector_with_fallbacks(html, body.css_selector.strip(), alts)
     if price is None or not used:

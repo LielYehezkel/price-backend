@@ -24,6 +24,30 @@ CHROME_WINDOWS_UA = (
 )
 
 
+def _origin_root(url: str) -> str:
+    from urllib.parse import urlparse
+
+    p = urlparse(url)
+    if not p.scheme or not p.netloc:
+        return url
+    return f"{p.scheme}://{p.netloc}/"
+
+
+def _curl_browser_headers(url: str) -> dict[str, str]:
+    """כותרות דמויות דפדפן — חשוב ל־WAF כשמשתמשים ב־curl_cffi."""
+    root = _origin_root(url)
+    return {
+        "Accept": (
+            "text/html,application/xhtml+xml,application/xml;q=0.9,"
+            "image/avif,image/webp,image/apng,*/*;q=0.8"
+        ),
+        "Accept-Language": "he-IL,he;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Referer": root,
+        "Cache-Control": "max-age=0",
+        "Upgrade-Insecure-Requests": "1",
+    }
+
+
 def _httpx_fallback_headers(url: str, *, full_sec_fetch: bool = True) -> dict[str, str]:
     from urllib.parse import urlparse
 
@@ -90,6 +114,19 @@ def _fetch_via_httpx(url: str, timeout: float) -> str:
         if r.status_code == 403:
             r = attempt(False)
 
+        # ניסיון אחרון: בלי Sec-Fetch-* — חלק מה־WAF דוחים כותרות Client Hints מזויפות
+        if r.status_code == 403:
+            r = client.get(
+                url,
+                headers={
+                    "User-Agent": CHROME_WINDOWS_UA,
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept-Language": "he-IL,he;q=0.9,en-US;q=0.8,en;q=0.7",
+                    "Referer": root,
+                    "Cache-Control": "max-age=0",
+                },
+            )
+
         r.raise_for_status()
         return r.text
 
@@ -99,17 +136,21 @@ def fetch_html_sync(url: str, timeout: float = 45.0) -> str:
     משיכה סינכרונית. עדיפות: curl_cffi (TLS כמו Chrome) — פותר 403 מול אתרי מסחר רבים.
     """
     if _CURL_CFFI and curl_requests is not None:
-        try:
-            r = curl_requests.get(
-                url,
-                impersonate="chrome",
-                timeout=timeout,
-                allow_redirects=True,
-            )
-            r.raise_for_status()
-            return r.text
-        except Exception as ex:
-            log.warning("curl_cffi fetch failed, trying httpx: %s", ex)
+        curl_headers = _curl_browser_headers(url)
+        # כמה פרופילי TLS — חלק מהאתרים אגרסיביים מול דאטה-סנטר
+        for impersonate in ("chrome124", "chrome131", "chrome120", "chrome116", "chrome110", "chrome"):
+            try:
+                r = curl_requests.get(
+                    url,
+                    impersonate=impersonate,
+                    timeout=timeout,
+                    allow_redirects=True,
+                    headers=curl_headers,
+                )
+                r.raise_for_status()
+                return r.text
+            except Exception as ex:
+                log.warning("curl_cffi impersonate=%s failed: %s", impersonate, ex)
 
     return _fetch_via_httpx(url, timeout)
 
@@ -119,18 +160,22 @@ async def fetch_html(url: str, timeout: float = 45.0) -> str:
         try:
             from curl_cffi.requests import AsyncSession
 
-            async with AsyncSession() as session:
-                r = await session.get(
-                    url,
-                    impersonate="chrome",
-                    timeout=timeout,
-                    allow_redirects=True,
-                )
-                r.raise_for_status()
-                return r.text
+            curl_headers = _curl_browser_headers(url)
+            for impersonate in ("chrome124", "chrome131", "chrome120", "chrome116", "chrome110", "chrome"):
+                try:
+                    async with AsyncSession() as session:
+                        r = await session.get(
+                            url,
+                            impersonate=impersonate,
+                            timeout=timeout,
+                            allow_redirects=True,
+                            headers=curl_headers,
+                        )
+                        r.raise_for_status()
+                        return r.text
+                except Exception as ex:
+                    log.warning("curl_cffi async impersonate=%s failed: %s", impersonate, ex)
         except ImportError:
             pass
-        except Exception as ex:
-            log.warning("curl_cffi async fetch failed, trying httpx fallback: %s", ex)
 
     return await asyncio.to_thread(_fetch_via_httpx, url, timeout)

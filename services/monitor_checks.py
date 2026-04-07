@@ -5,6 +5,7 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
+import httpx
 from sqlmodel import Session, select
 
 from backend.models import (
@@ -45,6 +46,40 @@ def _aware(dt: datetime | None) -> datetime | None:
     if dt.tzinfo is None:
         return dt.replace(tzinfo=timezone.utc)
     return dt
+
+
+def _finalize_after_fetch_error(
+    session: Session,
+    shop: Shop,
+    product: Product,
+    comp: CompetitorLink,
+    domain: str,
+    prev_comp: float | None,
+    *,
+    published: bool,
+    reason: str,
+) -> CompetitorCheckResult:
+    """לא ניתן למשוך HTML — לא מפילים את הסריקה; מסיימים בצורה מסודרת."""
+    comp.last_checked_at = utcnow()
+    session.add(comp)
+    session.add(
+        ScanLog(
+            shop_id=shop.id,
+            product_id=product.id,
+            competitor_link_id=comp.id,
+            competitor_domain=domain,
+            product_name=product.name or "",
+            our_price=product.regular_price,
+            competitor_price=None,
+            previous_competitor_price=prev_comp,
+            price_changed=False,
+            comparison="unknown",
+        ),
+    )
+    logger.warning("competitor_fetch_failed link=%s domain=%s %s", comp.id, domain, reason)
+    session.commit()
+    session.refresh(comp)
+    return CompetitorCheckResult(price=None, currency=None, published=published)
 
 
 def compare_prices(our: float | None, comp: float | None) -> str:
@@ -120,8 +155,22 @@ def run_competitor_check(session: Session, competitor_id: int) -> CompetitorChec
 
     prev_comp = comp.last_price
     domain = domain_from_url(comp.url)
-    html = fetch_html_sync(comp.url)
     live = domain_is_live(session, domain)
+    try:
+        html = fetch_html_sync(comp.url)
+    except httpx.HTTPStatusError as e:
+        code = e.response.status_code if e.response is not None else 0
+        return _finalize_after_fetch_error(
+            session, shop, product, comp, domain, prev_comp, published=live, reason=f"HTTP {code}",
+        )
+    except httpx.HTTPError as e:
+        return _finalize_after_fetch_error(
+            session, shop, product, comp, domain, prev_comp, published=live, reason=str(e),
+        )
+    except Exception as e:
+        return _finalize_after_fetch_error(
+            session, shop, product, comp, domain, prev_comp, published=live, reason=str(e),
+        )
 
     price: float | None = None
     cur: str | None = None
