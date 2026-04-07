@@ -24,7 +24,7 @@ from backend.services.auto_pricing import maybe_apply_auto_pricing
 from backend.services.domain_policy import domain_from_url, domain_is_live
 from backend.services.scan_engine_journal import append_operational_log_safe, classify_competitor_scan_failure
 from backend.services.extract import apply_saved_selector, run_extraction_pipeline
-from backend.services.fetch_html import fetch_html_sync
+from backend.services.fetch_html import FetchHtmlError, fetch_html_sync
 from backend.services.price_sanity import validate_competitor_price
 from backend.services.woo_sync import effective_wc_price, fetch_wc_product_by_id
 
@@ -158,6 +158,11 @@ def run_competitor_check(session: Session, competitor_id: int) -> CompetitorChec
     live = domain_is_live(session, domain)
     try:
         html = fetch_html_sync(comp.url)
+    except FetchHtmlError as e:
+        code = e.status_code if e.status_code is not None else 0
+        return _finalize_after_fetch_error(
+            session, shop, product, comp, domain, prev_comp, published=live, reason=f"HTTP {code}",
+        )
     except httpx.HTTPStatusError as e:
         code = e.response.status_code if e.response is not None else 0
         return _finalize_after_fetch_error(

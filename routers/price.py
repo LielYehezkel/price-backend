@@ -14,7 +14,7 @@ from backend.services.extract import (
     run_extraction_pipeline,
     validate_selector_with_fallbacks,
 )
-from backend.services.fetch_html import fetch_html
+from backend.services.fetch_html import FetchHtmlError, fetch_html, format_fetch_error_hebrew
 from backend.services.resolve_cache import get_cache, put_cache
 
 router = APIRouter(prefix="/api/price", tags=["price"])
@@ -46,7 +46,10 @@ async def run_price_resolve(session: Session, url_raw: str, *, ignore_saved_sele
     """לוגיקת resolve — לשימוש מ־/resolve ומפאנל אדמין (עם התעלמות מסלקטור שמור)."""
     url = _validate_url(url_raw.strip())
     domain = normalize_domain(url)
-    html = await fetch_html(url)
+    try:
+        html = await fetch_html(url)
+    except FetchHtmlError as e:
+        raise HTTPException(502, format_fetch_error_hebrew(e)) from None
 
     learned: str | None = None
     saved = session.get(DomainPriceSelector, domain)
@@ -111,7 +114,10 @@ async def confirm_selector(
             raise HTTPException(400, "מטמון פג תוקף או לא תואם לדומיין — הרץ שוב resolve")
         html = cached.html
     else:
-        html = await fetch_html(url)
+        try:
+            html = await fetch_html(url)
+        except FetchHtmlError as e:
+            raise HTTPException(502, format_fetch_error_hebrew(e)) from None
 
     alts = body.selector_alternates or []
     price, used = validate_selector_with_fallbacks(html, body.css_selector, alts)

@@ -26,13 +26,15 @@ from backend.models import (
 from backend.services.price_sanity import get_settings
 from backend.services.domain_policy import iter_competitor_ids_for_domain
 from backend.services.extract import run_extraction_pipeline, validate_selector_with_fallbacks
-from backend.services.fetch_html import fetch_html_sync
+from backend.services.fetch_html import FetchHtmlError, fetch_html_sync, format_fetch_error_hebrew
 
 
 def _safe_fetch_html_for_admin(url: str) -> str:
     """לא מחזיר 500 פנימי על 403 — הודעת שגיאה קריאה לפרונט."""
     try:
         return fetch_html_sync(url)
+    except FetchHtmlError as e:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, format_fetch_error_hebrew(e)) from e
     except httpx.HTTPStatusError as e:
         code = e.response.status_code if e.response is not None else "?"
         raise HTTPException(
