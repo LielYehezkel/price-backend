@@ -1,4 +1,5 @@
 from collections.abc import Generator
+import logging
 
 from sqlalchemy import text
 from sqlmodel import Session, SQLModel, create_engine, select
@@ -11,8 +12,14 @@ if _db_url.startswith("postgres://"):
     _db_url = _db_url.replace("postgres://", "postgresql://", 1)
 
 engine = create_engine(_db_url)
+log = logging.getLogger(__name__)
 
 DEFAULT_ADMIN_EMAIL = "liel@contra-adv.co.il"
+
+
+def _is_duplicate_column_error(ex: Exception) -> bool:
+    msg = str(ex).lower()
+    return "already exists" in msg or "duplicate column" in msg
 
 
 def _migrate_user_is_admin() -> None:
@@ -48,9 +55,10 @@ def _ensure_default_admin() -> None:
 def _migrate_shop_last_scan_cycle_at() -> None:
     with engine.begin() as conn:
         try:
-            conn.execute(text("ALTER TABLE shop ADD COLUMN last_scan_cycle_at DATETIME"))
-        except Exception:
-            pass
+            conn.execute(text("ALTER TABLE shop ADD COLUMN last_scan_cycle_at TIMESTAMP"))
+        except Exception as ex:
+            if not _is_duplicate_column_error(ex):
+                log.warning("Migration failed: shop.last_scan_cycle_at: %s", ex)
 
 
 def _migrate_shop_check_interval_minutes() -> None:
@@ -85,7 +93,7 @@ def _migrate_product_extended() -> None:
         ("image_url", "VARCHAR"),
         ("category_name", "VARCHAR"),
         ("category_path", "VARCHAR"),
-        ("last_price_sync_at", "DATETIME"),
+        ("last_price_sync_at", "TIMESTAMP"),
         ("auto_pricing_enabled", "INTEGER DEFAULT 0"),
         ("auto_pricing_min_price", "FLOAT"),
         ("auto_pricing_trigger_kind", "VARCHAR DEFAULT 'percent'"),
@@ -97,8 +105,9 @@ def _migrate_product_extended() -> None:
         with engine.begin() as conn:
             try:
                 conn.execute(text(f"ALTER TABLE product ADD COLUMN {name} {typ}"))
-            except Exception:
-                pass
+            except Exception as ex:
+                if not _is_duplicate_column_error(ex):
+                    log.warning("Migration failed: product.%s: %s", name, ex)
 
 
 def _migrate_shop_setup_and_pricing_strategy() -> None:

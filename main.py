@@ -3,8 +3,10 @@ import time
 from contextlib import asynccontextmanager
 
 from apscheduler.schedulers.background import BackgroundScheduler
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from backend.config import settings
 from backend.db import engine, init_db
@@ -64,6 +66,42 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def _apply_error_cors_headers(request: Request, response: JSONResponse) -> JSONResponse:
+    origin = request.headers.get("origin")
+    if not origin:
+        return response
+    if origins and "*" not in origins and origin not in origins:
+        return response
+    response.headers["Access-Control-Allow-Origin"] = origin
+    response.headers["Access-Control-Allow-Credentials"] = "true"
+    vary = response.headers.get("Vary")
+    if not vary:
+        response.headers["Vary"] = "Origin"
+    elif "origin" not in vary.lower():
+        response.headers["Vary"] = f"{vary}, Origin"
+    return response
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    payload = {"detail": exc.detail}
+    response = JSONResponse(status_code=exc.status_code, content=payload, headers=exc.headers)
+    return _apply_error_cors_headers(request, response)
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    response = JSONResponse(status_code=422, content={"detail": exc.errors()})
+    return _apply_error_cors_headers(request, response)
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    log.exception("Unhandled request error: %s %s", request.method, request.url.path)
+    response = JSONResponse(status_code=500, content={"detail": "Internal server error"})
+    return _apply_error_cors_headers(request, response)
 
 app.include_router(auth.router)
 app.include_router(admin.router)
