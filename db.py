@@ -84,6 +84,8 @@ def _migrate_shop_woo_currency() -> None:
 def _migrate_product_extended() -> None:
     cols = [
         ("image_url", "VARCHAR"),
+        ("category_name", "VARCHAR"),
+        ("category_path", "VARCHAR"),
         ("auto_pricing_enabled", "INTEGER DEFAULT 0"),
         ("auto_pricing_min_price", "FLOAT"),
         ("auto_pricing_trigger_kind", "VARCHAR DEFAULT 'percent'"),
@@ -176,6 +178,15 @@ def _ensure_scheduler_heartbeat_row() -> None:
             session.commit()
 
 
+def _ensure_admin_system_config_row() -> None:
+    from backend.models import AdminSystemConfig
+
+    with Session(engine) as session:
+        if session.get(AdminSystemConfig, 1) is None:
+            session.add(AdminSystemConfig(id=1, backend_mode="local"))
+            session.commit()
+
+
 def _migrate_alert_kind_column() -> None:
     with engine.begin() as conn:
         try:
@@ -212,6 +223,7 @@ def init_db() -> None:
     _ensure_default_admin()
     _ensure_price_sanity_defaults()
     _ensure_scheduler_heartbeat_row()
+    _ensure_admin_system_config_row()
     _backfill_tracked_competitors()
 
 

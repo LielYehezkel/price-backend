@@ -111,23 +111,43 @@ def compute_sales_insights(session: Session, shop_id: int, days: int = 90) -> di
     page = 1
     per_page = 100
     max_pages = 30
-    with httpx.Client(timeout=60.0) as http_client:
-        while page <= max_pages:
-            batch = _fetch_orders_page(
-                http_client,
-                base,
-                shop.woo_consumer_key,
-                shop.woo_consumer_secret,
-                page,
-                per_page,
-                after_iso,
-            )
-            if not batch:
-                break
-            all_orders.extend(batch)
-            if len(batch) < per_page:
-                break
-            page += 1
+    try:
+        with httpx.Client(timeout=60.0, follow_redirects=True) as http_client:
+            while page <= max_pages:
+                batch = _fetch_orders_page(
+                    http_client,
+                    base,
+                    shop.woo_consumer_key,
+                    shop.woo_consumer_secret,
+                    page,
+                    per_page,
+                    after_iso,
+                )
+                if not batch:
+                    break
+                all_orders.extend(batch)
+                if len(batch) < per_page:
+                    break
+                page += 1
+    except httpx.HTTPStatusError as ex:
+        return {
+            "ok": False,
+            "error": "woocommerce_http_error",
+            "message_he": (
+                "קריאת הזמנות מ-WooCommerce נכשלה. בדקו כתובת אתר (עם/בלי www), "
+                "הרשאות מפתח read_write ו-SSL. "
+                f"פרטי שגיאה: {ex!s}"
+            ),
+        }
+    except httpx.HTTPError as ex:
+        return {
+            "ok": False,
+            "error": "woocommerce_network_error",
+            "message_he": (
+                "לא ניתן להתחבר ל-WooCommerce כרגע (רשת/זמן תגובה). "
+                f"פרטי שגיאה: {ex!s}"
+            ),
+        }
 
     by_product_rev: dict[int, float] = defaultdict(float)
     by_product_units: dict[int, float] = defaultdict(float)

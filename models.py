@@ -73,6 +73,8 @@ class Product(SQLModel, table=True):
     sku: Optional[str] = None
     permalink: Optional[str] = None
     image_url: Optional[str] = None
+    category_name: Optional[str] = None
+    category_path: Optional[str] = None
     regular_price: Optional[float] = None
     # תמחור אוטומטי מול מתחרים (אופציונלי, פר מוצר)
     auto_pricing_enabled: bool = Field(default=False)
@@ -219,6 +221,26 @@ class WpSetupToken(SQLModel, table=True):
     created_at: datetime = Field(default_factory=utcnow)
     expires_at: datetime
     used_at: Optional[datetime] = None
+
+
+class WpConnectionToken(SQLModel, table=True):
+    """טוקן חיבור קבוע לתוסף WordPress (ללא תפוגה אוטומטית)."""
+
+    token: str = Field(primary_key=True, max_length=128)
+    shop_id: int = Field(foreign_key="shop.id", index=True, unique=True)
+    created_by_user_id: int = Field(foreign_key="user.id")
+    created_at: datetime = Field(default_factory=utcnow)
+    active: bool = Field(default=True, index=True)
+    last_used_at: Optional[datetime] = None
+
+
+class AdminSystemConfig(SQLModel, table=True):
+    """הגדרות מערכת גלובליות לניהול סביבת שרת/תקשורת."""
+
+    id: int = Field(default=1, primary_key=True)
+    backend_mode: str = Field(default="local")  # local | custom
+    backend_api_base: Optional[str] = None
+    updated_at: datetime = Field(default_factory=utcnow)
 
 
 class SalesInsightsCache(SQLModel, table=True):

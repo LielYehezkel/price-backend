@@ -1,4 +1,3 @@
-from datetime import timedelta
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -7,7 +6,7 @@ from sqlmodel import Session
 
 from backend.db import get_session
 from backend.deps import get_current_user
-from backend.models import Shop, User, WpSetupToken, utcnow
+from backend.models import Shop, User, WpConnectionToken, WpSetupToken, utcnow
 from backend.services.woo_sync import fetch_wc_store_currency
 
 router = APIRouter(prefix="/api/integrations", tags=["integrations"])
@@ -29,16 +28,24 @@ def wordpress_connect(
     body: WordPressConnectIn,
     session: Annotated[Session, Depends(get_session)],
 ) -> dict:
-    """נקרא מתוך תוסף WordPress — ללא JWT; מאמת טוקן הקמה חד-פעמי."""
-    tok = session.get(WpSetupToken, body.setup_token.strip())
-    if not tok:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "טוקן לא תקף")
-    if tok.used_at is not None:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "טוקן כבר נוצל")
-    if tok.expires_at < utcnow():
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "פג תוקף — הורידו תוסף מחדש")
+    """נקרא מתוך תוסף WordPress — ללא JWT; תומך בטוקן חד-פעמי ישן או טוקן חיבור קבוע."""
+    setup_token = body.setup_token.strip()
+    shop: Shop | None = None
+    legacy_tok: WpSetupToken | None = session.get(WpSetupToken, setup_token)
+    conn_tok: WpConnectionToken | None = None
 
-    shop = session.get(Shop, tok.shop_id)
+    if legacy_tok:
+        if legacy_tok.used_at is not None:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "טוקן כבר נוצל")
+        if legacy_tok.expires_at < utcnow():
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "פג תוקף — הורידו תוסף מחדש")
+        shop = session.get(Shop, legacy_tok.shop_id)
+    else:
+        conn_tok = session.get(WpConnectionToken, setup_token)
+        if not conn_tok or not conn_tok.active:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "טוקן לא תקף")
+        shop = session.get(Shop, conn_tok.shop_id)
+
     if not shop:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "חנות לא נמצאה")
 
@@ -55,9 +62,14 @@ def wordpress_connect(
     if cur:
         shop.woo_currency = cur
 
-    tok.used_at = utcnow()
+    now = utcnow()
+    if legacy_tok:
+        legacy_tok.used_at = now
+        session.add(legacy_tok)
+    if conn_tok:
+        conn_tok.last_used_at = now
+        session.add(conn_tok)
     session.add(shop)
-    session.add(tok)
     session.commit()
     return {"ok": True, "shop_id": shop.id, "woo_currency": shop.woo_currency}
 

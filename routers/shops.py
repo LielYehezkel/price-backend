@@ -2,6 +2,7 @@ import csv
 import hashlib
 import io
 import json
+import re
 import secrets
 from collections import defaultdict
 
@@ -12,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any
 from urllib.parse import urlparse
 
-from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Query, Response, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Query, Request, Response, UploadFile, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import and_, func, or_
@@ -37,6 +38,7 @@ from backend.models import (
     TrackedCompetitor,
     User,
     UserShopPreferences,
+    WpConnectionToken,
     WpSetupToken,
     utcnow,
 )
@@ -54,6 +56,7 @@ from backend.services.domain_queue_repair import (
 from backend.services.extract import run_extraction_pipeline
 from backend.services.fetch_html import fetch_html_sync
 from backend.services.monitor_checks import run_competitor_check
+from backend.services.system_config import resolve_public_api_base
 from backend.services.wp_plugin_packager import build_plugin_zip_bytes
 from backend.services.woo_sync import (
     fetch_wc_products,
@@ -90,6 +93,8 @@ class ProductOut(BaseModel):
     sku: str | None
     permalink: str | None
     image_url: str | None = None
+    category_name: str | None = None
+    category_path: str | None = None
     regular_price: float | None
     competitors_count: int = 0
     shop_currency: str | None = None
@@ -102,6 +107,13 @@ class ProductOut(BaseModel):
     auto_pricing_strategy: str = "reactive_down"
 
 
+class ProductPageOut(BaseModel):
+    items: list[ProductOut]
+    total: int
+    skip: int
+    limit: int
+
+
 class ProductAutoPricingPatch(BaseModel):
     auto_pricing_enabled: bool | None = None
     auto_pricing_min_price: float | None = None
@@ -110,6 +122,11 @@ class ProductAutoPricingPatch(BaseModel):
     auto_pricing_action_kind: str | None = None
     auto_pricing_action_value: float | None = None
     auto_pricing_strategy: str | None = None
+
+
+class ProductCategoryRow(BaseModel):
+    name: str
+    count: int
 
 
 class CompetitorOut(BaseModel):
@@ -339,6 +356,8 @@ def _product_to_out(session: Session, p: Product, shop: Shop) -> ProductOut:
         sku=p.sku,
         permalink=p.permalink,
         image_url=getattr(p, "image_url", None),
+        category_name=getattr(p, "category_name", None),
+        category_path=getattr(p, "category_path", None),
         regular_price=p.regular_price,
         competitors_count=int(cc or 0),
         shop_currency=getattr(shop, "woo_currency", None),
@@ -621,6 +640,33 @@ class AccountHealthOut(BaseModel):
     summary: str
 
 
+class CompetitorCurrentSummaryOut(BaseModel):
+    cheaper: int
+    expensive: int
+    tie: int
+    compared: int
+
+
+class CompetitorIntelRowOut(BaseModel):
+    tracked_competitor_id: int | None
+    competitor_name: str
+    domain: str
+    links_count: int
+    current_cheaper: int
+    current_expensive: int
+    current_tie: int
+    current_compared: int
+    price_changes_in_period: int
+    last_price_change_at: str | None
+
+
+class CompetitorIntelligenceOut(BaseModel):
+    period_days: int
+    current_overall: CompetitorCurrentSummaryOut
+    total_price_changes_in_period: int
+    competitors: list[CompetitorIntelRowOut]
+
+
 @router.get("/{shop_id}/account-health", response_model=AccountHealthOut)
 def account_health(
     shop_id: int,
@@ -730,6 +776,121 @@ def account_health(
     return AccountHealthOut(status=status, score=score, issues=issues, summary=summary)
 
 
+@router.get("/{shop_id}/competitors/intelligence", response_model=CompetitorIntelligenceOut)
+def competitors_intelligence(
+    shop_id: int,
+    session: Annotated[Session, Depends(get_session)],
+    user: Annotated[User, Depends(get_current_user)],
+    days: int = Query(30, ge=1, le=365),
+):
+    """תמונת תחרות: זול/יקר/שווה כרגע + קצב שינויי מחיר בתקופה."""
+    require_shop_access(session, user, shop_id)
+    comps = session.exec(
+        select(CompetitorLink)
+        .join(Product, CompetitorLink.product_id == Product.id)
+        .where(Product.shop_id == shop_id),
+    ).all()
+    if not comps:
+        return CompetitorIntelligenceOut(
+            period_days=days,
+            current_overall=CompetitorCurrentSummaryOut(cheaper=0, expensive=0, tie=0, compared=0),
+            total_price_changes_in_period=0,
+            competitors=[],
+        )
+
+    # latest scan per competitor_link = מצב נוכחי מול אותו מתחרה.
+    latest_by_link: dict[int, ScanLog] = {}
+    for c in comps:
+        lg = session.exec(
+            select(ScanLog)
+            .where(ScanLog.competitor_link_id == c.id)
+            .order_by(ScanLog.id.desc())
+            .limit(1),
+        ).first()
+        if lg:
+            latest_by_link[c.id] = lg
+
+    since = utcnow() - timedelta(days=days)
+    change_logs = session.exec(
+        select(ScanLog).where(
+            ScanLog.shop_id == shop_id,
+            ScanLog.created_at >= since,
+            ScanLog.price_changed == True,  # noqa: E712
+        ),
+    ).all()
+    changes_by_domain: dict[str, int] = defaultdict(int)
+    last_change_at_by_domain: dict[str, datetime] = {}
+    for lg in change_logs:
+        dom = (lg.competitor_domain or "").strip().lower()
+        if not dom:
+            continue
+        changes_by_domain[dom] += 1
+        prev = last_change_at_by_domain.get(dom)
+        if prev is None or lg.created_at > prev:
+            last_change_at_by_domain[dom] = lg.created_at
+
+    tracked_cache: dict[int, TrackedCompetitor] = {}
+    grouped: dict[str, CompetitorIntelRowOut] = {}
+    for c in comps:
+        dom = domain_from_url(c.url)
+        tid = getattr(c, "tracked_competitor_id", None)
+        if tid and tid not in tracked_cache:
+            tc = session.get(TrackedCompetitor, tid)
+            if tc:
+                tracked_cache[tid] = tc
+        name = tracked_cache[tid].display_name if tid and tid in tracked_cache else ((c.label or "").strip() or dom)
+        key = f"{tid or 0}:{dom}"
+        row = grouped.get(key)
+        if not row:
+            row = CompetitorIntelRowOut(
+                tracked_competitor_id=tid,
+                competitor_name=name,
+                domain=dom,
+                links_count=0,
+                current_cheaper=0,
+                current_expensive=0,
+                current_tie=0,
+                current_compared=0,
+                price_changes_in_period=0,
+                last_price_change_at=None,
+            )
+            grouped[key] = row
+        row.links_count += 1
+
+        lg = latest_by_link.get(c.id)
+        if lg and lg.comparison in {"you_cheaper", "you_expensive", "tie"}:
+            row.current_compared += 1
+            if lg.comparison == "you_cheaper":
+                row.current_cheaper += 1
+            elif lg.comparison == "you_expensive":
+                row.current_expensive += 1
+            elif lg.comparison == "tie":
+                row.current_tie += 1
+
+        row.price_changes_in_period += int(changes_by_domain.get(dom, 0))
+        dt = last_change_at_by_domain.get(dom)
+        if dt:
+            row.last_price_change_at = dt.isoformat()
+
+    competitors = sorted(
+        grouped.values(),
+        key=lambda r: (r.current_compared, r.current_expensive, r.price_changes_in_period),
+        reverse=True,
+    )
+    overall = CompetitorCurrentSummaryOut(
+        cheaper=sum(r.current_cheaper for r in competitors),
+        expensive=sum(r.current_expensive for r in competitors),
+        tie=sum(r.current_tie for r in competitors),
+        compared=sum(r.current_compared for r in competitors),
+    )
+    return CompetitorIntelligenceOut(
+        period_days=days,
+        current_overall=overall,
+        total_price_changes_in_period=sum(r.price_changes_in_period for r in competitors),
+        competitors=competitors,
+    )
+
+
 @router.get("/{shop_id}/reports/weekly.csv")
 def weekly_report_csv(
     shop_id: int,
@@ -811,10 +972,17 @@ def sales_insights(
     now = utcnow()
 
     if force_refresh:
-        data = wa.compute_sales_insights(session, shop_id, days)
-        if data.get("ok"):
-            wa.save_sales_insights_cache(session, shop_id, days, data)
-        return wa.attach_cache_meta(data, fresh=True, computed_at=now)
+        try:
+            data = wa.compute_sales_insights(session, shop_id, days)
+            if data.get("ok"):
+                wa.save_sales_insights_cache(session, shop_id, days, data)
+            return wa.attach_cache_meta(data, fresh=True, computed_at=now)
+        except Exception as ex:
+            return {
+                "ok": False,
+                "error": "sales_insights_failed",
+                "message_he": f"דוח מכירות נכשל כרגע: {ex!s}",
+            }
 
     row = wa.get_sales_insights_cache_row(session, shop_id, days)
     if row is not None:
@@ -828,10 +996,17 @@ def sales_insights(
             background_tasks.add_task(wa.refresh_sales_insights_cache_task, shop_id, days)
             return wa.attach_cache_meta(cached, fresh=False, stale=True, computed_at=row.updated_at)
 
-    data = wa.compute_sales_insights(session, shop_id, days)
-    if data.get("ok"):
-        wa.save_sales_insights_cache(session, shop_id, days, data)
-    return wa.attach_cache_meta(data, fresh=True, computed_at=now)
+    try:
+        data = wa.compute_sales_insights(session, shop_id, days)
+        if data.get("ok"):
+            wa.save_sales_insights_cache(session, shop_id, days, data)
+        return wa.attach_cache_meta(data, fresh=True, computed_at=now)
+    except Exception as ex:
+        return {
+            "ok": False,
+            "error": "sales_insights_failed",
+            "message_he": f"דוח מכירות נכשל כרגע: {ex!s}",
+        }
 
 
 class ScanLogOut(BaseModel):
@@ -905,8 +1080,14 @@ def sync_shop(
     shop = require_shop_access(session, user, shop_id)
     if not shop.woo_site_url or not shop.woo_consumer_key or not shop.woo_consumer_secret:
         raise HTTPException(400, "יש לשמור פרטי WooCommerce בהגדרות")
-    rows = fetch_wc_products(shop.woo_site_url, shop.woo_consumer_key, shop.woo_consumer_secret)
-    cur = fetch_wc_store_currency(shop.woo_site_url, shop.woo_consumer_key, shop.woo_consumer_secret)
+    try:
+        rows = fetch_wc_products(shop.woo_site_url, shop.woo_consumer_key, shop.woo_consumer_secret)
+        cur = fetch_wc_store_currency(shop.woo_site_url, shop.woo_consumer_key, shop.woo_consumer_secret)
+    except Exception as ex:
+        raise HTTPException(
+            400,
+            f"סנכרון מול WooCommerce נכשל: {ex!s}. בדקו כתובת אתר, מפתחות API, SSL והרשאות read_write.",
+        ) from ex
     if cur:
         shop.woo_currency = cur
         session.add(shop)
@@ -922,6 +1103,16 @@ def sync_shop(
         pr = r.get("regular_price") or r.get("price")
         price = parse_price(pr)
         img = first_product_image_url(r)
+        cats_raw = r.get("categories")
+        cat_names: list[str] = []
+        if isinstance(cats_raw, list):
+            for c in cats_raw:
+                if isinstance(c, dict):
+                    nm = str(c.get("name") or "").strip()
+                    if nm:
+                        cat_names.append(nm)
+        category_name = cat_names[0] if cat_names else None
+        category_path = " > ".join(cat_names) if cat_names else None
         existing = session.exec(
             select(Product).where(Product.shop_id == shop.id, Product.woo_product_id == wid)
         ).first()
@@ -931,6 +1122,8 @@ def sync_shop(
             existing.permalink = str(link) if link else None
             existing.regular_price = price
             existing.image_url = img
+            existing.category_name = category_name
+            existing.category_path = category_path
             session.add(existing)
         else:
             session.add(
@@ -941,6 +1134,8 @@ def sync_shop(
                     sku=str(sku) if sku else None,
                     permalink=str(link) if link else None,
                     image_url=img,
+                    category_name=category_name,
+                    category_path=category_path,
                     regular_price=price,
                 )
             )
@@ -949,19 +1144,57 @@ def sync_shop(
     return {"synced": n}
 
 
-@router.get("/{shop_id}/products", response_model=list[ProductOut])
+@router.get("/{shop_id}/products", response_model=ProductPageOut)
 def list_products(
     shop_id: int,
     session: Annotated[Session, Depends(get_session)],
     user: Annotated[User, Depends(get_current_user)],
     q: str | None = None,
+    category: str | None = None,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(80, ge=1, le=300),
 ):
     shop = require_shop_access(session, user, shop_id)
-    products = session.exec(select(Product).where(Product.shop_id == shop_id)).all()
-    out = [_product_to_out(session, p, shop) for p in products]
+    stmt = select(Product).where(Product.shop_id == shop_id)
+    cat = (category or "").strip()
+    if cat and cat != "__all__":
+        if cat == "__uncategorized__":
+            stmt = stmt.where(
+                or_(Product.category_name.is_(None), Product.category_name == ""),
+            )
+        else:
+            stmt = stmt.where(Product.category_name == cat)
     if q:
-        ql = q.lower()
-        out = [p for p in out if ql in p.name.lower()]
+        qq = q.strip()
+        if qq:
+            like = f"%{qq}%"
+            stmt = stmt.where(or_(Product.name.like(like), Product.sku.like(like)))
+
+    total = session.exec(select(func.count()).select_from(stmt.subquery())).first() or 0
+    rows = session.exec(stmt.order_by(Product.id).offset(skip).limit(limit)).all()
+    out = [_product_to_out(session, p, shop) for p in rows]
+    return ProductPageOut(items=out, total=int(total), skip=skip, limit=limit)
+
+
+@router.get("/{shop_id}/products/categories", response_model=list[ProductCategoryRow])
+def list_product_categories(
+    shop_id: int,
+    session: Annotated[Session, Depends(get_session)],
+    user: Annotated[User, Depends(get_current_user)],
+):
+    require_shop_access(session, user, shop_id)
+    rows = session.exec(
+        select(Product.category_name, func.count(Product.id))
+        .where(Product.shop_id == shop_id, Product.category_name.is_not(None))
+        .group_by(Product.category_name)
+        .order_by(func.count(Product.id).desc(), Product.category_name.asc()),
+    ).all()
+    out: list[ProductCategoryRow] = []
+    for name, count in rows:
+        nm = (name or "").strip()
+        if not nm:
+            continue
+        out.append(ProductCategoryRow(name=nm, count=int(count or 0)))
     return out
 
 
@@ -1881,22 +2114,36 @@ def save_woo(
 @router.get("/{shop_id}/wordpress-plugin.zip")
 def download_wordpress_plugin_zip(
     shop_id: int,
+    request: Request,
     session: Annotated[Session, Depends(get_session)],
     user: Annotated[User, Depends(get_current_user)],
+    api_base_override: str | None = Query(None, alias="api_base"),
 ):
     require_shop_access(session, user, shop_id)
-    raw = secrets.token_urlsafe(48)
-    expires = utcnow() + timedelta(days=7)
-    row = WpSetupToken(
-        token=raw,
-        shop_id=shop_id,
-        created_by_user_id=user.id,
-        expires_at=expires,
-    )
-    session.add(row)
-    session.commit()
-    api_base = settings.public_api_base.rstrip("/")
-    zip_bytes = build_plugin_zip_bytes(api_base, raw)
+    row = session.exec(
+        select(WpConnectionToken).where(
+            WpConnectionToken.shop_id == shop_id,
+            WpConnectionToken.active == True,  # noqa: E712
+        ),
+    ).first()
+    if not row:
+        row = WpConnectionToken(
+            token=secrets.token_urlsafe(64),
+            shop_id=shop_id,
+            created_by_user_id=user.id,
+            active=True,
+        )
+        session.add(row)
+        session.commit()
+        session.refresh(row)
+    override = (api_base_override or "").strip().rstrip("/")
+    if override:
+        if not (override.startswith("http://") or override.startswith("https://")):
+            raise HTTPException(400, "api_base חייב להתחיל ב-http:// או https://")
+        api_base = override
+    else:
+        api_base = resolve_public_api_base(session, request)
+    zip_bytes = build_plugin_zip_bytes(api_base, row.token)
     buf = BytesIO(zip_bytes)
     fname = f"price-resolver-connect-shop-{shop_id}.zip"
     return StreamingResponse(
@@ -1911,23 +2158,41 @@ def download_competitors_import_template(
     shop_id: int,
     session: Annotated[Session, Depends(get_session)],
     user: Annotated[User, Depends(get_current_user)],
+    category: str | None = Query(None, description="שם קטגוריה (כמו שמופיע במוצרים)"),
 ):
     require_shop_access(session, user, shop_id)
-    products = session.exec(select(Product).where(Product.shop_id == shop_id).order_by(Product.id)).all()
+    stmt = select(Product).where(Product.shop_id == shop_id)
+    cat = (category or "").strip()
+    if cat:
+        stmt = stmt.where(Product.category_name == cat)
+    products = session.exec(stmt.order_by(Product.id)).all()
     wb = Workbook()
     ws = wb.active
     ws.title = "import"
-    ws.append(["product_id", "sku", "product_name", "competitor_url", "competitor_label"])
+    ws.append(["product_id", "sku", "product_name", "category", "competitor_url", "competitor_label"])
     for p in products:
-        ws.append([p.id, p.sku or "", p.name, "", ""])
+        ws.append([p.id, p.sku or "", p.name, getattr(p, "category_name", None) or "", "", ""])
+    ws2 = wb.create_sheet("instructions")
+    ws2.append(["איך ממלאים את הקובץ"])
+    ws2.append(["1) לא משנים את product_id / sku / product_name / category."])
+    ws2.append(["2) ממלאים competitor_url עם קישור מלא למוצר אצל מתחרה."])
+    ws2.append(["3) competitor_label אופציונלי; אם ריק, יילקח שם קיים או דומיין."])
+    ws2.append(["4) אפשר כמה שורות לאותו מוצר — קישור אחד בכל שורה."])
+    ws2.append(["5) שורות בלי competitor_url יידלגו ולא יעשו נזק."])
+    ws2.append(["6) בסוף מעלים את הקובץ במסך מוצרים ומתחרים."])
     buf = BytesIO()
     wb.save(buf)
     buf.seek(0)
+    if cat:
+        safe = re.sub(r"[^A-Za-z0-9._-]+", "-", cat).strip("-").lower()
+        suffix = f"-{safe[:48]}" if safe else "-category"
+    else:
+        suffix = "-all"
     return StreamingResponse(
         buf,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={
-            "Content-Disposition": f'attachment; filename="competitors-import-template-{shop_id}.xlsx"',
+            "Content-Disposition": f'attachment; filename="competitors-import-template-{shop_id}{suffix}.xlsx"',
         },
     )
 

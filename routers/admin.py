@@ -29,6 +29,7 @@ from backend.services.fetch_html import fetch_html_sync
 from backend.services.domain_queue_repair import repair_all_missing_domain_queue_items_global
 from backend.services.monitor_checks import run_competitor_check
 from backend.services.scan_engine_journal import compute_scan_engine_health, get_or_create_heartbeat
+from backend.services.system_config import get_or_create_system_config
 from backend.routers.price import ResolveOut, run_price_resolve
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
@@ -801,4 +802,56 @@ def admin_dashboard_overview(
         pending_domain_reviews=int(pending_domain_reviews),
         ops_errors_24h=int(ops_errors_24h),
         ops_warnings_24h=int(ops_warnings_24h),
+    )
+
+
+class AdminSystemConfigOut(BaseModel):
+    backend_mode: str
+    backend_api_base: str | None
+    updated_at: str
+
+
+class AdminSystemConfigPatch(BaseModel):
+    backend_mode: str | None = None  # local | custom
+    backend_api_base: str | None = None
+
+
+@router.get("/system/config", response_model=AdminSystemConfigOut)
+def get_system_config(
+    session: Annotated[Session, Depends(get_session)],
+    _admin: Annotated[User, Depends(get_current_admin)],
+):
+    row = get_or_create_system_config(session)
+    return AdminSystemConfigOut(
+        backend_mode=row.backend_mode,
+        backend_api_base=row.backend_api_base,
+        updated_at=row.updated_at.isoformat(),
+    )
+
+
+@router.patch("/system/config", response_model=AdminSystemConfigOut)
+def patch_system_config(
+    body: AdminSystemConfigPatch,
+    session: Annotated[Session, Depends(get_session)],
+    _admin: Annotated[User, Depends(get_current_admin)],
+):
+    row = get_or_create_system_config(session)
+    if body.backend_mode is not None:
+        mode = body.backend_mode.strip().lower()
+        if mode not in {"local", "custom"}:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "backend_mode חייב להיות local או custom")
+        row.backend_mode = mode
+    if body.backend_api_base is not None:
+        val = body.backend_api_base.strip()
+        if val and not (val.startswith("http://") or val.startswith("https://")):
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "backend_api_base חייב להתחיל ב-http:// או https://")
+        row.backend_api_base = val or None
+    row.updated_at = utcnow()
+    session.add(row)
+    session.commit()
+    session.refresh(row)
+    return AdminSystemConfigOut(
+        backend_mode=row.backend_mode,
+        backend_api_base=row.backend_api_base,
+        updated_at=row.updated_at.isoformat(),
     )

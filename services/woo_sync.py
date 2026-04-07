@@ -9,7 +9,7 @@ def fetch_wc_products(site_url: str, consumer_key: str, consumer_secret: str) ->
     params = {"per_page": 100, "consumer_key": consumer_key, "consumer_secret": consumer_secret}
     out: list[dict[str, Any]] = []
     page = 1
-    with httpx.Client(timeout=40.0) as client:
+    with httpx.Client(timeout=40.0, follow_redirects=True) as client:
         while True:
             r = client.get(url, params={**params, "page": page})
             r.raise_for_status()
@@ -48,7 +48,7 @@ def fetch_wc_store_currency(site_url: str, consumer_key: str, consumer_secret: s
     url = f"{base}/wp-json/wc/v3/settings/general"
     params = _wc_auth_params(consumer_key, consumer_secret)
     try:
-        with httpx.Client(timeout=25.0) as client:
+        with httpx.Client(timeout=25.0, follow_redirects=True) as client:
             r = client.get(url, params=params)
             r.raise_for_status()
             data = r.json()
@@ -78,7 +78,7 @@ def patch_wc_product_regular_price(
     params = _wc_auth_params(consumer_key, consumer_secret)
     # WooCommerce expects string price
     body = {"regular_price": f"{regular_price:.2f}"}
-    with httpx.Client(timeout=30.0) as client:
+    with httpx.Client(timeout=30.0, follow_redirects=True) as client:
         r = client.put(url, params=params, json=body)
         r.raise_for_status()
 
