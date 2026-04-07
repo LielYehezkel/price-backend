@@ -593,13 +593,13 @@ def scan_engine_summary(
 
     raw_rows = session.execute(
         text("""
-            SELECT strftime('%Y-%m-%d %H:00', created_at) AS bucket, COUNT(*) AS n
+            SELECT to_char(date_trunc('hour', created_at), 'YYYY-MM-DD HH24:00') AS bucket, COUNT(*) AS n
             FROM scanlog
             WHERE created_at >= :since
             GROUP BY bucket
             ORDER BY bucket
         """),
-        {"since": since24.isoformat()},
+        {"since": since24},
     ).mappings().all()
     counts = {str(r["bucket"]): int(r["n"]) for r in raw_rows if r["bucket"] is not None}
 

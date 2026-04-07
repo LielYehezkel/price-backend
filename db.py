@@ -1,17 +1,16 @@
 from collections.abc import Generator
-from pathlib import Path
 
 from sqlalchemy import text
 from sqlmodel import Session, SQLModel, create_engine, select
 
 from backend.config import settings
 
-Path("backend/data").mkdir(parents=True, exist_ok=True)
+# Normalise the URL: Render supplies postgres:// but SQLAlchemy requires postgresql://
+_db_url = settings.database_url
+if _db_url.startswith("postgres://"):
+    _db_url = _db_url.replace("postgres://", "postgresql://", 1)
 
-engine = create_engine(
-    settings.database_url,
-    connect_args={"check_same_thread": False},
-)
+engine = create_engine(_db_url)
 
 DEFAULT_ADMIN_EMAIL = "liel@contra-adv.co.il"
 
