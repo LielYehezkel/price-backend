@@ -27,9 +27,36 @@ def fetch_wc_products(site_url: str, consumer_key: str, consumer_secret: str) ->
     return out
 
 
+def fetch_wc_product_by_id(
+    site_url: str,
+    consumer_key: str,
+    consumer_secret: str,
+    woo_product_id: int,
+) -> dict[str, Any]:
+    base = site_url.rstrip("/")
+    url = f"{base}/wp-json/wc/v3/products/{int(woo_product_id)}"
+    params = {"consumer_key": consumer_key, "consumer_secret": consumer_secret}
+    with httpx.Client(timeout=25.0, follow_redirects=True) as client:
+        r = client.get(url, params=params)
+        r.raise_for_status()
+        data = r.json()
+    return data if isinstance(data, dict) else {}
+
+
 def parse_price(val: Any) -> float | None:
     if val is None:
         return None
+
+
+def effective_wc_price(row: dict[str, Any]) -> float | None:
+    """מחיר מכירה בפועל: price, ואם חסר sale_price, ואם חסר regular_price."""
+    p_now = parse_price(row.get("price"))
+    if p_now is not None:
+        return p_now
+    p_sale = parse_price(row.get("sale_price"))
+    if p_sale is not None:
+        return p_sale
+    return parse_price(row.get("regular_price"))
     if isinstance(val, (int, float)):
         return float(val)
     try:

@@ -25,6 +25,7 @@ from backend.services.scan_engine_journal import append_operational_log_safe, cl
 from backend.services.extract import apply_saved_selector, run_extraction_pipeline
 from backend.services.fetch_html import fetch_html_sync
 from backend.services.price_sanity import validate_competitor_price
+from backend.services.woo_sync import effective_wc_price, fetch_wc_product_by_id
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +56,56 @@ def compare_prices(our: float | None, comp: float | None) -> str:
     return "you_cheaper" if our < comp else "you_expensive"
 
 
+def _is_our_price_stale(product: Product, *, max_age_seconds: int) -> bool:
+    last = getattr(product, "last_price_sync_at", None)
+    if last is None:
+        return True
+    dt = _aware(last)
+    if dt is None:
+        return True
+    return (utcnow() - dt).total_seconds() >= max_age_seconds
+
+
+def _refresh_our_price_if_stale(session: Session, shop: Shop, product: Product) -> None:
+    """
+    רענון נקודתי למחיר המוצר מהחנות לפני השוואה מול מתחרה.
+    עדכון מחיר נשמר רק אם השתנה בפועל.
+    """
+    if not product.woo_product_id:
+        return
+    if not shop.woo_site_url or not shop.woo_consumer_key or not shop.woo_consumer_secret:
+        return
+
+    # מוצרים בסריקה צריכים דיוק גבוה, אך בלי להציף את השרת.
+    ttl_seconds = 120
+    if not _is_our_price_stale(product, max_age_seconds=ttl_seconds):
+        return
+
+    try:
+        row = fetch_wc_product_by_id(
+            shop.woo_site_url,
+            shop.woo_consumer_key,
+            shop.woo_consumer_secret,
+            int(product.woo_product_id),
+        )
+    except Exception:
+        # כשל רשת נקודתי לא אמור לעצור את הסריקה; נמשיך עם המחיר הקיים.
+        return
+
+    new_price = effective_wc_price(row)
+    old_price = product.regular_price
+    if old_price is None or new_price is None:
+        changed = old_price != new_price
+    else:
+        changed = abs(float(old_price) - float(new_price)) > 0.005
+    if changed:
+        product.regular_price = new_price
+    product.last_price_sync_at = utcnow()
+    session.add(product)
+    session.commit()
+    session.refresh(product)
+
+
 def run_competitor_check(session: Session, competitor_id: int) -> CompetitorCheckResult:
     comp = session.get(CompetitorLink, competitor_id)
     if not comp:
@@ -65,6 +116,7 @@ def run_competitor_check(session: Session, competitor_id: int) -> CompetitorChec
     shop = session.get(Shop, product.shop_id)
     if not shop:
         raise ValueError("shop not found")
+    _refresh_our_price_if_stale(session, shop, product)
 
     prev_comp = comp.last_price
     domain = domain_from_url(comp.url)

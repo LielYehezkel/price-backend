@@ -59,10 +59,10 @@ from backend.services.monitor_checks import run_competitor_check
 from backend.services.system_config import resolve_public_api_base
 from backend.services.wp_plugin_packager import build_plugin_zip_bytes
 from backend.services.woo_sync import (
+    effective_wc_price,
     fetch_wc_products,
     fetch_wc_store_currency,
     first_product_image_url,
-    parse_price,
 )
 
 router = APIRouter(prefix="/api/shops", tags=["shops"])
@@ -1099,9 +1099,9 @@ def sync_shop(
         name = r.get("name") or "—"
         sku = r.get("sku")
         link = r.get("permalink")
-        price = None
-        pr = r.get("regular_price") or r.get("price")
-        price = parse_price(pr)
+        # מחיר מכירה בפועל: אם יש מבצע Woo מחזיר אותו ב-price.
+        # fallback ל-sale_price ואז ל-regular_price.
+        price = effective_wc_price(r)
         img = first_product_image_url(r)
         cats_raw = r.get("categories")
         cat_names: list[str] = []
@@ -1120,7 +1120,14 @@ def sync_shop(
             existing.name = str(name)
             existing.sku = str(sku) if sku else None
             existing.permalink = str(link) if link else None
-            existing.regular_price = price
+            old_price = existing.regular_price
+            if old_price is None or price is None:
+                changed = old_price != price
+            else:
+                changed = abs(float(old_price) - float(price)) > 0.005
+            if changed:
+                existing.regular_price = price
+            existing.last_price_sync_at = utcnow()
             existing.image_url = img
             existing.category_name = category_name
             existing.category_path = category_path
@@ -1137,6 +1144,7 @@ def sync_shop(
                     category_name=category_name,
                     category_path=category_path,
                     regular_price=price,
+                    last_price_sync_at=utcnow(),
                 )
             )
         n += 1

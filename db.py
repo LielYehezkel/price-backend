@@ -85,6 +85,7 @@ def _migrate_product_extended() -> None:
         ("image_url", "VARCHAR"),
         ("category_name", "VARCHAR"),
         ("category_path", "VARCHAR"),
+        ("last_price_sync_at", "DATETIME"),
         ("auto_pricing_enabled", "INTEGER DEFAULT 0"),
         ("auto_pricing_min_price", "FLOAT"),
         ("auto_pricing_trigger_kind", "VARCHAR DEFAULT 'percent'"),

@@ -76,6 +76,7 @@ class Product(SQLModel, table=True):
     category_name: Optional[str] = None
     category_path: Optional[str] = None
     regular_price: Optional[float] = None
+    last_price_sync_at: Optional[datetime] = None
     # תמחור אוטומטי מול מתחרים (אופציונלי, פר מוצר)
     auto_pricing_enabled: bool = Field(default=False)
     auto_pricing_min_price: Optional[float] = None
