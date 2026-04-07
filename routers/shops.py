@@ -61,6 +61,7 @@ from backend.services.wp_plugin_packager import build_plugin_zip_bytes
 from backend.services.woo_sync import (
     effective_wc_price,
     fetch_wc_products,
+    fetch_wc_products_by_ids,
     fetch_wc_store_currency,
     first_product_image_url,
 )
@@ -1150,6 +1151,83 @@ def sync_shop(
         n += 1
     session.commit()
     return {"synced": n}
+
+
+@router.post("/{shop_id}/refresh-prices")
+def refresh_shop_prices(
+    shop_id: int,
+    session: Annotated[Session, Depends(get_session)],
+    user: Annotated[User, Depends(get_current_user)],
+):
+    """
+    מעדכן מחירי מכירה בפועל (ומבצעים) רק למוצרים שכבר קיימים במערכת —
+    בלי לייבא מחדש את כל הקטלוג ומבלי להוסיף מוצרים חדשים מהחנות.
+    """
+    shop = require_shop_access(session, user, shop_id)
+    if not shop.woo_site_url or not shop.woo_consumer_key or not shop.woo_consumer_secret:
+        raise HTTPException(400, "יש לשמור פרטי WooCommerce בהגדרות")
+
+    rows = list(
+        session.exec(
+            select(Product).where(
+                Product.shop_id == shop_id,
+                Product.woo_product_id.is_not(None),
+            ),
+        ).all(),
+    )
+    woo_ids = sorted({int(p.woo_product_id) for p in rows if p.woo_product_id is not None})
+    if not woo_ids:
+        return {"checked": 0, "updated": 0, "missing_in_woo": 0}
+
+    try:
+        wc_by_id = fetch_wc_products_by_ids(
+            shop.woo_site_url,
+            shop.woo_consumer_key,
+            shop.woo_consumer_secret,
+            woo_ids,
+        )
+    except Exception as ex:
+        raise HTTPException(
+            400,
+            f"רענון מחירים מול WooCommerce נכשל: {ex!s}. בדקו חיבור, מפתחות API והרשאות.",
+        ) from ex
+
+    cur = fetch_wc_store_currency(shop.woo_site_url, shop.woo_consumer_key, shop.woo_consumer_secret)
+    if cur:
+        shop.woo_currency = cur
+        session.add(shop)
+
+    now = utcnow()
+    updated = 0
+    checked = len(rows)
+    missing = 0
+
+    for p in rows:
+        if p.woo_product_id is None:
+            continue
+        wid = int(p.woo_product_id)
+        row = wc_by_id.get(wid)
+        if not row:
+            missing += 1
+            continue
+        new_price = effective_wc_price(row)
+        old_price = p.regular_price
+        if old_price is None or new_price is None:
+            price_changed = old_price != new_price
+        else:
+            price_changed = abs(float(old_price) - float(new_price)) > 0.005
+        if price_changed:
+            p.regular_price = new_price
+            updated += 1
+        p.last_price_sync_at = now
+        session.add(p)
+
+    session.commit()
+    return {
+        "checked": checked,
+        "updated": updated,
+        "missing_in_woo": missing,
+    }
 
 
 @router.get("/{shop_id}/products", response_model=ProductPageOut)

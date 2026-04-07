@@ -1,3 +1,4 @@
+import re
 from typing import Any
 
 import httpx
@@ -27,6 +28,43 @@ def fetch_wc_products(site_url: str, consumer_key: str, consumer_secret: str) ->
     return out
 
 
+def fetch_wc_products_by_ids(
+    site_url: str,
+    consumer_key: str,
+    consumer_secret: str,
+    ids: list[int],
+) -> dict[int, dict[str, Any]]:
+    """משיכה לפי מזהי WooCommerce (`include`). מחזיר מילון id -> אובייקט מוצר מה־API."""
+    if not ids:
+        return {}
+    base = site_url.rstrip("/")
+    url = f"{base}/wp-json/wc/v3/products"
+    out: dict[int, dict[str, Any]] = {}
+    # WooCommerce: עד ~100 פריטים לבקשה יציב
+    chunk_size = 100
+    with httpx.Client(timeout=90.0, follow_redirects=True) as client:
+        for i in range(0, len(ids), chunk_size):
+            chunk = ids[i : i + chunk_size]
+            params = {
+                "consumer_key": consumer_key,
+                "consumer_secret": consumer_secret,
+                "include": ",".join(str(x) for x in chunk),
+                "per_page": 100,
+            }
+            r = client.get(url, params=params)
+            r.raise_for_status()
+            batch = r.json()
+            if not isinstance(batch, list):
+                continue
+            for row in batch:
+                if isinstance(row, dict) and row.get("id") is not None:
+                    try:
+                        out[int(row["id"])] = row
+                    except (TypeError, ValueError):
+                        pass
+    return out
+
+
 def fetch_wc_product_by_id(
     site_url: str,
     consumer_key: str,
@@ -46,23 +84,64 @@ def fetch_wc_product_by_id(
 def parse_price(val: Any) -> float | None:
     if val is None:
         return None
+    s = str(val).strip()
+    if not s:
+        return None
+    if isinstance(val, (int, float)):
+        return float(val)
+    try:
+        return float(s.replace(",", "."))
+    except ValueError:
+        pass
+    # מחיר עם סמל מטבע / טקסט נלווה: "₪ 12.90", "12,90 ₪"
+    m = re.search(r"[-+]?\d+(?:[.,]\d+)?", s.replace(",", "."))
+    if m:
+        try:
+            return float(m.group(0))
+        except ValueError:
+            return None
+    return None
+
+
+def _price_from_range_or_plain(val: Any) -> float | None:
+    """טווח מחירים של מוצר משתנה ב־price, למשל '199 – 299' או '199-299'."""
+    if val is None:
+        return None
+    s = str(val).strip()
+    if not s:
+        return None
+    for sep in ("\u2013", "\u2014", " - ", "-", "\u00a0-\u00a0"):
+        if sep in s:
+            left = s.split(sep, 1)[0].strip()
+            return parse_price(left)
+    return None
 
 
 def effective_wc_price(row: dict[str, Any]) -> float | None:
-    """מחיר מכירה בפועל: price, ואם חסר sale_price, ואם חסר regular_price."""
-    p_now = parse_price(row.get("price"))
+    """מחיר מכירה בפועל: price (כולל מבצע), ואם ריק — sale_price, ואז regular_price.
+
+    מוצר משתנה (variable): לרוב price/range; אם ריק משתמשים ב-min של טווח המחירים.
+    """
+    raw_price = row.get("price")
+    p_now = parse_price(raw_price)
+    if p_now is None and raw_price:
+        p_now = _price_from_range_or_plain(raw_price)
     if p_now is not None:
         return p_now
     p_sale = parse_price(row.get("sale_price"))
     if p_sale is not None:
         return p_sale
-    return parse_price(row.get("regular_price"))
-    if isinstance(val, (int, float)):
-        return float(val)
-    try:
-        return float(str(val).replace(",", "."))
-    except ValueError:
-        return None
+    p_reg = parse_price(row.get("regular_price"))
+    if p_reg is not None:
+        return p_reg
+    # Woo variable product / חלק מהתבניות: טווח בטקסט או שדות min
+    p_min_s = parse_price(row.get("min_price"))
+    if p_min_s is not None:
+        return p_min_s
+    p_min_reg = parse_price(row.get("regular_min_price"))
+    if p_min_reg is not None:
+        return p_min_reg
+    return None
 
 
 def _wc_auth_params(consumer_key: str, consumer_secret: str) -> dict[str, str]:
