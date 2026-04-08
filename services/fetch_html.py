@@ -14,12 +14,26 @@ log = logging.getLogger(__name__)
 class FetchHtmlError(Exception):
     """נכשלה משיכת HTML (חסימת אתר, רשת וכו') — לא לבלבל עם באג שרת."""
 
-    def __init__(self, message: str, *, status_code: int | None = None):
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        api_status_code: int | None = None,
+        final_reason: str | None = None,
+    ):
         super().__init__(message)
         self.status_code = status_code
+        self.api_status_code = api_status_code
+        self.final_reason = final_reason
 
 
 def format_fetch_error_hebrew(e: FetchHtmlError) -> str:
+    if e.api_status_code and e.api_status_code != 502:
+        return (
+            "האתר חסם גם את המשיכה הרגילה וגם את ניסיונות ה-fallback (כולל proxy). "
+            "זו חסימה בצד אתר היעד. נסו שוב מאוחר יותר או מהדפדפן המקומי."
+        )
     """הודעה ללקוח API (502) — לא לזרוק 500 על חסימת WAF."""
     c = e.status_code
     if c == 403:
@@ -36,6 +50,10 @@ def format_fetch_error_hebrew(e: FetchHtmlError) -> str:
     return f"לא ניתן להתחבר לאתר: {e!s}"
 
 
+def fetch_error_api_status(e: FetchHtmlError) -> int:
+    return int(e.api_status_code or 502)
+
+
 try:
     from curl_cffi import requests as curl_requests
 
@@ -50,12 +68,19 @@ CHROME_WINDOWS_UA = (
     "Chrome/131.0.0.0 Safari/537.36"
 )
 
-_BLOCK_MARKERS = (
+_BLOCK_MARKERS_STRONG = (
     "access denied",
     "verify you are human",
     "cf-challenge",
     "captcha",
+    "attention required",
+    "cloudflare ray id",
+)
+
+_BLOCK_MARKERS_WEAK = (
     "blocked",
+    "forbidden",
+    "request blocked",
 )
 
 
@@ -229,12 +254,34 @@ async def _fetch_html_primary(url: str, timeout: float = 45.0) -> str:
 
 
 def _is_blocked_html(html: str | None) -> bool:
-    if not html:
-        return True
-    if len(html) < 2000:
+    if not html or not html.strip():
         return True
     low = html.lower()
-    return any(m in low for m in _BLOCK_MARKERS)
+    if any(m in low for m in _BLOCK_MARKERS_STRONG):
+        return True
+    weak_hits = sum(1 for m in _BLOCK_MARKERS_WEAK if m in low)
+    if weak_hits >= 2:
+        return True
+    # עמוד קצר מאוד + אינדיקציית חסימה חלשה = סביר שזה דף חסימה
+    if len(low) < 300 and (weak_hits >= 1 or "error" in low):
+        return True
+    return False
+
+
+def _blocked_markers_found(html: str | None) -> list[str]:
+    if not html:
+        return ["empty"]
+    low = html.lower()
+    hit: list[str] = []
+    for m in _BLOCK_MARKERS_STRONG:
+        if m in low:
+            hit.append(m)
+    weak = [m for m in _BLOCK_MARKERS_WEAK if m in low]
+    if weak:
+        hit.extend(weak)
+    if len(low) < 300 and ("error" in low):
+        hit.append("short_error")
+    return hit
 
 
 def _is_blocking_error(e: Exception) -> bool:
@@ -253,7 +300,11 @@ def fetch_html_browserless(url: str, use_proxy: bool = False, timeout: float = 4
         raise FetchHtmlError("Browserless token missing")
 
     endpoint = f"https://production-sfo.browserless.io/content?token={token}"
-    payload: dict[str, object] = {"url": url}
+    payload: dict[str, object] = {
+        "url": url,
+        "gotoOptions": {"waitUntil": "networkidle2", "timeout": int(timeout * 1000)},
+        "waitForTimeout": 1200,
+    }
     if use_proxy:
         payload["proxy"] = "residential"
 
@@ -262,11 +313,26 @@ def fetch_html_browserless(url: str, use_proxy: bool = False, timeout: float = 4
     try:
         with httpx.Client(timeout=timeout, follow_redirects=True, trust_env=True) as client:
             r = client.post(endpoint, json=payload)
+            log.info("fetch stage=%s status=%s url=%s", stage, r.status_code, url)
             if r.status_code >= 400:
                 raise FetchHtmlError(f"Browserless HTTP {r.status_code}", status_code=r.status_code)
             html = r.text or ""
-            if _is_blocked_html(html):
-                raise FetchHtmlError("Browserless blocked/empty html", status_code=403)
+            markers = _blocked_markers_found(html)
+            blocked = _is_blocked_html(html)
+            log.info(
+                "fetch stage=%s html_len=%s blocked=%s markers=%s url=%s",
+                stage,
+                len(html),
+                blocked,
+                ",".join(markers) if markers else "-",
+                url,
+            )
+            if blocked:
+                raise FetchHtmlError(
+                    "Browserless blocked/empty html",
+                    status_code=403,
+                    final_reason=f"stage={stage};len={len(html)};markers={markers}",
+                )
             return html
     except FetchHtmlError:
         raise
@@ -276,10 +342,20 @@ def fetch_html_browserless(url: str, use_proxy: bool = False, timeout: float = 4
 
 def fetch_html_sync_with_fallback(url: str, timeout: float = 45.0) -> str:
     token = (os.getenv("BROWSERLESS_TOKEN") or "").strip()
+    proxy_attempted = False
     try:
         log.info("fetch stage=normal url=%s", url)
         html = _fetch_html_primary_sync(url, timeout=timeout)
-        if _is_blocked_html(html):
+        markers = _blocked_markers_found(html)
+        blocked = _is_blocked_html(html)
+        log.info(
+            "fetch stage=normal status=200 html_len=%s blocked=%s markers=%s url=%s",
+            len(html or ""),
+            blocked,
+            ",".join(markers) if markers else "-",
+            url,
+        )
+        if blocked:
             raise FetchHtmlError("Blocked html on normal fetch", status_code=403)
         return html
     except Exception as e:
@@ -294,15 +370,40 @@ def fetch_html_sync_with_fallback(url: str, timeout: float = 45.0) -> str:
             return fetch_html_browserless(url, use_proxy=False, timeout=timeout)
         except Exception as e2:
             log.warning("fallback triggered stage=browserless url=%s err=%s", url, e2)
-            return fetch_html_browserless(url, use_proxy=True, timeout=timeout)
+            proxy_attempted = True
+            try:
+                return fetch_html_browserless(url, use_proxy=True, timeout=timeout)
+            except Exception as e3:
+                log.error(
+                    "fetch failed all stages url=%s proxy_attempted=%s final_reason=%s",
+                    url,
+                    proxy_attempted,
+                    e3,
+                )
+                raise FetchHtmlError(
+                    "all_fetch_stages_blocked",
+                    status_code=403,
+                    api_status_code=424,
+                    final_reason=str(e3),
+                ) from e3
 
 
 async def fetch_html_with_fallback(url: str, timeout: float = 45.0) -> str:
     token = (os.getenv("BROWSERLESS_TOKEN") or "").strip()
+    proxy_attempted = False
     try:
         log.info("fetch stage=normal url=%s", url)
         html = await _fetch_html_primary(url, timeout=timeout)
-        if _is_blocked_html(html):
+        markers = _blocked_markers_found(html)
+        blocked = _is_blocked_html(html)
+        log.info(
+            "fetch stage=normal status=200 html_len=%s blocked=%s markers=%s url=%s",
+            len(html or ""),
+            blocked,
+            ",".join(markers) if markers else "-",
+            url,
+        )
+        if blocked:
             raise FetchHtmlError("Blocked html on normal fetch", status_code=403)
         return html
     except Exception as e:
@@ -317,7 +418,22 @@ async def fetch_html_with_fallback(url: str, timeout: float = 45.0) -> str:
             return await asyncio.to_thread(fetch_html_browserless, url, False, timeout)
         except Exception as e2:
             log.warning("fallback triggered stage=browserless url=%s err=%s", url, e2)
-            return await asyncio.to_thread(fetch_html_browserless, url, True, timeout)
+            proxy_attempted = True
+            try:
+                return await asyncio.to_thread(fetch_html_browserless, url, True, timeout)
+            except Exception as e3:
+                log.error(
+                    "fetch failed all stages url=%s proxy_attempted=%s final_reason=%s",
+                    url,
+                    proxy_attempted,
+                    e3,
+                )
+                raise FetchHtmlError(
+                    "all_fetch_stages_blocked",
+                    status_code=403,
+                    api_status_code=424,
+                    final_reason=str(e3),
+                ) from e3
 
 
 def fetch_html_sync(url: str, timeout: float = 45.0) -> str:

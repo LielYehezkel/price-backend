@@ -14,7 +14,12 @@ from backend.services.extract import (
     run_extraction_pipeline,
     validate_selector_with_fallbacks,
 )
-from backend.services.fetch_html import FetchHtmlError, fetch_html, format_fetch_error_hebrew
+from backend.services.fetch_html import (
+    FetchHtmlError,
+    fetch_error_api_status,
+    fetch_html,
+    format_fetch_error_hebrew,
+)
 from backend.services.resolve_cache import get_cache, put_cache
 
 router = APIRouter(prefix="/api/price", tags=["price"])
@@ -49,7 +54,7 @@ async def run_price_resolve(session: Session, url_raw: str, *, ignore_saved_sele
     try:
         html = await fetch_html(url)
     except FetchHtmlError as e:
-        raise HTTPException(502, format_fetch_error_hebrew(e)) from None
+        raise HTTPException(fetch_error_api_status(e), format_fetch_error_hebrew(e)) from None
 
     learned: str | None = None
     saved = session.get(DomainPriceSelector, domain)
@@ -117,7 +122,7 @@ async def confirm_selector(
         try:
             html = await fetch_html(url)
         except FetchHtmlError as e:
-            raise HTTPException(502, format_fetch_error_hebrew(e)) from None
+            raise HTTPException(fetch_error_api_status(e), format_fetch_error_hebrew(e)) from None
 
     alts = body.selector_alternates or []
     price, used = validate_selector_with_fallbacks(html, body.css_selector, alts)
