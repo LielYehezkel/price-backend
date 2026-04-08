@@ -402,6 +402,16 @@ def _css_escape_ident(s: str) -> str:
     return re.sub(r"([^a-zA-Z0-9_-])", lambda m: "\\" + m.group(1), s)
 
 
+def _is_dynamic_id(eid: str) -> bool:
+    if not eid:
+        return True
+    if len(eid) > 36:
+        return True
+    if re.search(r"\d{4,}", eid):
+        return True
+    return bool(re.search(r"(elementor-|post-\d+|product-\d+|uid-|__|tmp|react)", eid, re.I))
+
+
 def build_unique_css_selector(el: Tag) -> str:
     parts: list[str] = []
     cur: Tag | None = el
@@ -433,6 +443,78 @@ def build_unique_css_selector(el: Tag) -> str:
     return " > ".join(parts) if parts else el.name
 
 
+def _stable_classes(tag: Tag, *, max_items: int = 2) -> list[str]:
+    raw = tag.get("class") or []
+    if not isinstance(raw, list):
+        raw = [str(raw)]
+    out: list[str] = []
+    for c in raw:
+        c = str(c).strip()
+        if not c or len(c) < 3:
+            continue
+        if re.search(r"(^js-|^is-|^has-|active|selected|current|loaded|hover|focus|open|close)", c, re.I):
+            continue
+        if re.search(r"\d{4,}", c):
+            continue
+        out.append(c)
+        if len(out) >= max_items:
+            break
+    return out
+
+
+def _canonical_selector_for_price_node(el: Tag) -> tuple[str, list[str], str]:
+    """
+    Selector יציב לשמירה בדומיין:
+    - מעדיף span.woocommerce-Price-amount (לא bdi פנימי)
+    - מעדיף class paths יציבים
+    - נמנע מ-id דינמי
+    """
+    target = el
+    if el.name == "bdi":
+        p = el.parent
+        if isinstance(p, Tag) and "woocommerce-Price-amount" in " ".join(p.get("class") or []):
+            target = p
+
+    tcls = " ".join(target.get("class") or []).lower()
+    if "woocommerce-price-amount" in tcls:
+        if target.find_parent(class_=re.compile(r"elementor-widget-woocommerce-product-price", re.I)):
+            primary = ".elementor-widget-woocommerce-product-price .woocommerce-Price-amount"
+            alts = [
+                ".single-product .summary .woocommerce-Price-amount",
+                ".entry-summary .woocommerce-Price-amount",
+                "div.product .summary .woocommerce-Price-amount",
+            ]
+            return primary, alts, "woo_amount"
+        if target.find_parent(class_=re.compile(r"entry-summary|summary", re.I)):
+            primary = ".single-product .summary .woocommerce-Price-amount"
+            alts = [
+                ".entry-summary .woocommerce-Price-amount",
+                "div.product .summary .woocommerce-Price-amount",
+                ".woocommerce div.product .summary .woocommerce-Price-amount",
+            ]
+            return primary, alts, "woo_amount"
+        return ".woocommerce-Price-amount", [".price .woocommerce-Price-amount"], "woo_amount"
+
+    parts: list[str] = []
+    cur: Tag | None = target
+    for _ in range(6):
+        if cur is None or not isinstance(cur, Tag) or cur.name in ("html", "[document]"):
+            break
+        eid = (cur.get("id") or "").strip()
+        if eid and not _is_dynamic_id(eid):
+            parts.append(f"#{_css_escape_ident(eid)}")
+            break
+        sc = _stable_classes(cur, max_items=2)
+        if sc:
+            parts.append(cur.name + "".join(f".{_css_escape_ident(c)}" for c in sc))
+        else:
+            parts.append(cur.name)
+        cur = cur.parent if isinstance(cur.parent, Tag) else None
+    parts.reverse()
+    primary = " > ".join(parts) if parts else build_unique_css_selector(target)
+    return primary, [build_unique_css_selector(target)], "class_path"
+
+
 # מספרים שנראים כמחיר בעמוד מוצר (לא שנים / מיקוד)
 _PRICE_IN_TEXT = re.compile(
     r"\d{1,3}(?:[.,\s]\d{3})*(?:[.,]\d{1,2})\b"  # 1,234.56 / 1.234,56
@@ -442,30 +524,83 @@ _PRICE_IN_TEXT = re.compile(
 
 
 def _push_candidate(
-    candidates: list[tuple[float, float, str, str, list[str]]],
+    candidates: list[dict[str, Any]],
     seen: set[str],
     parent: Tag,
     chunk: str,
     *,
     bonus: float = 0,
+    selector_type: str = "text",
 ) -> None:
     chunk = chunk.strip()
     if not chunk:
         return
     if not (pn := parse_price_number(chunk)):
         return
-    sel = build_unique_css_selector(parent)
-    key = f"{sel}|{chunk}|{pn:.4f}"
+    sel, alts, stable_kind = _canonical_selector_for_price_node(parent)
+    key = f"{sel}|{pn:.4f}"
     if key in seen:
         return
     seen.add(key)
-    sc = _score_element(parent) + bonus
-    candidates.append((sc, pn, chunk, sel, []))
+    inside_summary = bool(parent.find_parent(class_=re.compile(r"\b(summary|entry-summary)\b", re.I)))
+    inside_form_cart = bool(parent.find_parent("form", class_=re.compile(r"\bcart\b", re.I)))
+    inside_related = bool(parent.find_parent(class_=_LOOP_ANCESTOR))
+    inside_loop = _inside_wc_loop_product(parent) or bool(parent.find_parent(class_=re.compile(r"loop|products", re.I)))
+    inside_sale = bool(parent.find_parent("ins"))
+    inside_strike = bool(parent.find_parent(["del", "s", "strike"])) or parent.name in ("del", "s", "strike")
+    focus_depth = _element_depth(parent)
+
+    context_boost = 0.0
+    if inside_summary:
+        context_boost += 2.2
+    if inside_form_cart:
+        context_boost += 2.4
+    if parent.find_parent(class_=re.compile(r"\b(product|type-product)\b", re.I)):
+        context_boost += 2.0
+    if parent.find_parent(class_=re.compile(r"elementor-widget-woocommerce-product-price", re.I)):
+        context_boost += 3.0
+    if parent.find_parent(["article", "div"], class_=re.compile(r"\bproduct\b", re.I)):
+        context_boost += 1.3
+
+    noise_score = 0.0
+    if inside_related:
+        noise_score += 2.5
+    if inside_loop:
+        noise_score += 2.5
+    if inside_strike:
+        noise_score += 1.8
+
+    base_score = _score_element(parent)
+    final_score = base_score + bonus + context_boost - noise_score
+    candidates.append(
+        {
+            "price_text": chunk,
+            "score": round(final_score, 2),
+            "selector": sel,
+            "selector_alternates": alts,
+            "inside_summary": inside_summary,
+            "inside_form_cart": inside_form_cart,
+            "inside_related": inside_related,
+            "inside_loop": inside_loop,
+            "inside_sale": inside_sale,
+            "inside_strike": inside_strike,
+            "focus_depth": focus_depth,
+            "noise_score": round(noise_score, 2),
+            "selector_type": selector_type if selector_type else stable_kind,
+            "score_breakdown": {
+                "base": round(base_score, 2),
+                "bonus": round(bonus, 2),
+                "context_boost": round(context_boost, 2),
+                "noise_penalty": round(noise_score, 2),
+                "final": round(final_score, 2),
+            },
+        },
+    )
 
 
 def _collect_attribute_price_candidates(
     soup: BeautifulSoup,
-    candidates: list[tuple[float, float, str, str, list[str]]],
+    candidates: list[dict[str, Any]],
     seen: set[str],
 ) -> None:
     def consider_tag(tag: Tag, bonus: float, attr_val: str | None) -> None:
@@ -479,15 +614,22 @@ def _collect_attribute_price_candidates(
                 if cents > 100 and cents < 50_000_000:
                     v = cents / 100.0
                     if 0 < v < 1_000_000:
-                        sel = build_unique_css_selector(tag)
-                        key = f"{sel}|{val}|{v:.4f}|cents"
+                        sel, _alts, _kind = _canonical_selector_for_price_node(tag)
+                        key = f"{sel}|{v:.4f}|cents"
                         if key not in seen:
                             seen.add(key)
-                            candidates.append((_score_element(tag) + bonus + 2.0, v, f"{v:.2f}", sel, []))
+                            _push_candidate(
+                                candidates,
+                                seen,
+                                tag,
+                                f"{v:.2f}",
+                                bonus=bonus + 2.0,
+                                selector_type="attr_cents",
+                            )
                         return
             except ValueError:
                 pass
-        _push_candidate(candidates, seen, tag, val, bonus=bonus + 2.5)
+        _push_candidate(candidates, seen, tag, val, bonus=bonus + 2.5, selector_type="attr")
 
     for tag in soup.find_all(True):
         if not isinstance(tag, Tag):
@@ -503,26 +645,57 @@ def _collect_attribute_price_candidates(
             if c:
                 consider_tag(tag, 2.0, c)
             else:
-                _push_candidate(candidates, seen, tag, tag.get_text(" ", strip=True), bonus=2.0)
+                _push_candidate(
+                    candidates,
+                    seen,
+                    tag,
+                    tag.get_text(" ", strip=True),
+                    bonus=2.0,
+                    selector_type="microdata",
+                )
+
+
+_EXPLICIT_PRICE_SELECTORS: tuple[tuple[str, float, str], ...] = (
+    ("ins .woocommerce-Price-amount", 7.0, "ins_woo"),
+    (".woocommerce-Price-amount", 6.0, "woo_amount"),
+    ("[itemprop='price']", 5.0, "itemprop_price"),
+    ("[data-product-price]", 5.0, "data_product_price"),
+    ("[data-price]", 4.5, "data_price"),
+    (".money", 4.5, "money"),
+    (".amount", 3.8, "amount"),
+    (".price", 3.2, "price"),
+)
+
+
+def _collect_explicit_price_like_candidates(
+    soup: BeautifulSoup,
+    candidates: list[dict[str, Any]],
+    seen: set[str],
+) -> None:
+    for q, bonus, kind in _EXPLICIT_PRICE_SELECTORS:
+        for node in soup.select(q):
+            if not isinstance(node, Tag):
+                continue
+            if _is_inside_script_style(node):
+                continue
+            txt = _element_raw_price_text(node)
+            if not txt:
+                txt = node.get_text(" ", strip=True)
+            if not txt:
+                continue
+            _push_candidate(candidates, seen, node, txt, bonus=bonus, selector_type=kind)
 
 
 def collect_price_candidates(html: str, limit: int = 40) -> list[dict[str, Any]]:
     soup = BeautifulSoup(html, "html.parser")
-    candidates: list[tuple[float, float, str, str, list[str]]] = []
+    candidates: list[dict[str, Any]] = []
     seen: set[str] = set()
 
+    # שלב 1: explicit מחיריים
+    _collect_explicit_price_like_candidates(soup, candidates, seen)
+    # שלב 2: attributes (itemprop/data-*)
     _collect_attribute_price_candidates(soup, candidates, seen)
-
-    # מחירי Woo כמכלול — מונע תת־התאמות כמו "990" מתוך "1,990" ממילוי string=True
-    for amount in soup.select(".woocommerce-Price-amount"):
-        if not isinstance(amount, Tag):
-            continue
-        if _woo_price_node_excluded(amount):
-            continue
-        txt = _element_raw_price_text(amount)
-        if txt and parse_price_number(txt):
-            _push_candidate(candidates, seen, amount, txt, bonus=6.0)
-
+    # שלב 3: text-node רחב (fallback בלבד)
     for el in soup.find_all(string=True):
         if not isinstance(el, NavigableString):
             continue
@@ -538,19 +711,16 @@ def collect_price_candidates(html: str, limit: int = 40) -> list[dict[str, Any]]
             continue
         for m in _PRICE_IN_TEXT.finditer(raw):
             chunk = m.group(0).strip()
-            _push_candidate(candidates, seen, parent, chunk, bonus=0)
+            _push_candidate(candidates, seen, parent, chunk, bonus=0, selector_type="text")
 
-    candidates.sort(key=lambda x: (-x[0], -x[1]))
+    def _pn(c: dict[str, Any]) -> float:
+        v = parse_price_number(str(c.get("price_text") or ""))
+        return float(v) if v is not None else 0.0
+
+    candidates.sort(key=lambda c: (-(c.get("score") or 0), -_pn(c)))
     out: list[dict[str, Any]] = []
-    for sc, _pn, chunk, sel, alts in candidates[:limit]:
-        out.append(
-            {
-                "price_text": chunk,
-                "score": round(sc, 2),
-                "selector": sel,
-                "selector_alternates": alts,
-            },
-        )
+    for c in candidates[:limit]:
+        out.append(c)
     return out
 
 
