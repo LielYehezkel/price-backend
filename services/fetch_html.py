@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 
 import httpx
 
@@ -47,6 +48,14 @@ except ImportError:
 CHROME_WINDOWS_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/131.0.0.0 Safari/537.36"
+)
+
+_BLOCK_MARKERS = (
+    "access denied",
+    "verify you are human",
+    "cf-challenge",
+    "captcha",
+    "blocked",
 )
 
 
@@ -163,7 +172,7 @@ def _fetch_via_httpx(url: str, timeout: float) -> str:
         raise FetchHtmlError(str(e) or "network error") from e
 
 
-def fetch_html_sync(url: str, timeout: float = 45.0) -> str:
+def _fetch_html_primary_sync(url: str, timeout: float = 45.0) -> str:
     """
     משיכה סינכרונית. עדיפות: curl_cffi (TLS כמו Chrome) — פותר 403 מול אתרי מסחר רבים.
     """
@@ -190,7 +199,7 @@ def fetch_html_sync(url: str, timeout: float = 45.0) -> str:
     return _fetch_via_httpx(url, timeout)
 
 
-async def fetch_html(url: str, timeout: float = 45.0) -> str:
+async def _fetch_html_primary(url: str, timeout: float = 45.0) -> str:
     if _CURL_CFFI:
         try:
             from curl_cffi.requests import AsyncSession
@@ -217,3 +226,103 @@ async def fetch_html(url: str, timeout: float = 45.0) -> str:
             pass
 
     return await asyncio.to_thread(_fetch_via_httpx, url, timeout)
+
+
+def _is_blocked_html(html: str | None) -> bool:
+    if not html:
+        return True
+    if len(html) < 2000:
+        return True
+    low = html.lower()
+    return any(m in low for m in _BLOCK_MARKERS)
+
+
+def _is_blocking_error(e: Exception) -> bool:
+    if isinstance(e, FetchHtmlError):
+        if e.status_code in (403, 429):
+            return True
+        return True  # timeout/network/other fetch errors should trigger fallback
+    if isinstance(e, httpx.HTTPError):
+        return True
+    return True
+
+
+def fetch_html_browserless(url: str, use_proxy: bool = False, timeout: float = 45.0) -> str:
+    token = (os.getenv("BROWSERLESS_TOKEN") or "").strip()
+    if not token:
+        raise FetchHtmlError("Browserless token missing")
+
+    endpoint = f"https://production-sfo.browserless.io/content?token={token}"
+    payload: dict[str, object] = {"url": url}
+    if use_proxy:
+        payload["proxy"] = "residential"
+
+    stage = "browserless_proxy" if use_proxy else "browserless"
+    log.info("fetch stage=%s url=%s", stage, url)
+    try:
+        with httpx.Client(timeout=timeout, follow_redirects=True, trust_env=True) as client:
+            r = client.post(endpoint, json=payload)
+            if r.status_code >= 400:
+                raise FetchHtmlError(f"Browserless HTTP {r.status_code}", status_code=r.status_code)
+            html = r.text or ""
+            if _is_blocked_html(html):
+                raise FetchHtmlError("Browserless blocked/empty html", status_code=403)
+            return html
+    except FetchHtmlError:
+        raise
+    except httpx.RequestError as e:
+        raise FetchHtmlError(str(e) or "browserless network error") from e
+
+
+def fetch_html_sync_with_fallback(url: str, timeout: float = 45.0) -> str:
+    token = (os.getenv("BROWSERLESS_TOKEN") or "").strip()
+    try:
+        log.info("fetch stage=normal url=%s", url)
+        html = _fetch_html_primary_sync(url, timeout=timeout)
+        if _is_blocked_html(html):
+            raise FetchHtmlError("Blocked html on normal fetch", status_code=403)
+        return html
+    except Exception as e:
+        if not _is_blocking_error(e):
+            raise
+        log.warning("fallback triggered stage=normal url=%s err=%s", url, e)
+        if not token:
+            log.warning("BROWSERLESS_TOKEN missing; skipping browserless fallback url=%s", url)
+            if isinstance(e, Exception):
+                raise e
+        try:
+            return fetch_html_browserless(url, use_proxy=False, timeout=timeout)
+        except Exception as e2:
+            log.warning("fallback triggered stage=browserless url=%s err=%s", url, e2)
+            return fetch_html_browserless(url, use_proxy=True, timeout=timeout)
+
+
+async def fetch_html_with_fallback(url: str, timeout: float = 45.0) -> str:
+    token = (os.getenv("BROWSERLESS_TOKEN") or "").strip()
+    try:
+        log.info("fetch stage=normal url=%s", url)
+        html = await _fetch_html_primary(url, timeout=timeout)
+        if _is_blocked_html(html):
+            raise FetchHtmlError("Blocked html on normal fetch", status_code=403)
+        return html
+    except Exception as e:
+        if not _is_blocking_error(e):
+            raise
+        log.warning("fallback triggered stage=normal url=%s err=%s", url, e)
+        if not token:
+            log.warning("BROWSERLESS_TOKEN missing; skipping browserless fallback url=%s", url)
+            if isinstance(e, Exception):
+                raise e
+        try:
+            return await asyncio.to_thread(fetch_html_browserless, url, False, timeout)
+        except Exception as e2:
+            log.warning("fallback triggered stage=browserless url=%s err=%s", url, e2)
+            return await asyncio.to_thread(fetch_html_browserless, url, True, timeout)
+
+
+def fetch_html_sync(url: str, timeout: float = 45.0) -> str:
+    return fetch_html_sync_with_fallback(url, timeout=timeout)
+
+
+async def fetch_html(url: str, timeout: float = 45.0) -> str:
+    return await fetch_html_with_fallback(url, timeout=timeout)
