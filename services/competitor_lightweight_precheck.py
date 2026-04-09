@@ -36,11 +36,17 @@ class LightweightCheckOutcome:
     status_code: int | None = None
     price: float | None = None
     prefix_hash: str | None = None
+    html: str | None = None  # גוף HTML מלא ל-put_cache כשמדלגים על fetch כבד
 
 
 def _hash_html_prefix(html: str) -> str:
     chunk = (html or "")[:_LIGHT_HTML_PREFIX_LEN].encode("utf-8", errors="ignore")
     return hashlib.sha256(chunk).hexdigest()
+
+
+def html_prefix_hash_from_html(html: str) -> str:
+    """Hash ציבורי ל-50KB ראשונים — לאחר fetch מלא לעדכון מטמון resolve."""
+    return _hash_html_prefix(html)
 
 
 def lightweight_check(url: str, css_selector: str, *, timeout: float = 10.0) -> LightweightCheckOutcome:
@@ -73,7 +79,13 @@ def lightweight_check(url: str, css_selector: str, *, timeout: float = 10.0) -> 
             return LightweightCheckOutcome(ok=False, status_code=r.status_code)
         ph = _hash_html_prefix(html)
         price = apply_saved_selector(html, sel)
-        return LightweightCheckOutcome(ok=True, status_code=r.status_code, price=price, prefix_hash=ph)
+        return LightweightCheckOutcome(
+            ok=True,
+            status_code=r.status_code,
+            price=price,
+            prefix_hash=ph,
+            html=html,
+        )
     except Exception as ex:
         logger.debug("lightweight_check failed url=%s err=%s", url, ex, exc_info=True)
         return LightweightCheckOutcome(ok=False)

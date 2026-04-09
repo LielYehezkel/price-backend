@@ -182,6 +182,17 @@ class DomainPriceSelector(SQLModel, table=True):
     updated_at: datetime = Field(default_factory=utcnow)
 
 
+class PriceResolveUrlCache(SQLModel, table=True):
+    """מטמון resolve לפי URL — מאפשר לדלג על Playwright כשאין שינוי (lightweight + hash)."""
+
+    url_key: str = Field(primary_key=True, max_length=64)  # sha256 hex של URL מנורמל
+    url_canonical: str = Field(max_length=4096)
+    domain: str = Field(index=True, max_length=512)
+    last_price: Optional[float] = None
+    last_checked_at: datetime = Field(default_factory=utcnow)
+    last_html_prefix_hash: Optional[str] = Field(default=None, max_length=64)
+
+
 class DomainReviewQueueItem(SQLModel, table=True):
     """תור ביקורת — פריט לכל מוצר/קישור; מאפשר מאות ממתינים לאותו דומיין בלי דריסה."""
 

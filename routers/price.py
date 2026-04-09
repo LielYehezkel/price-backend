@@ -1,4 +1,6 @@
+import asyncio
 import json
+import logging
 from typing import Annotated, Any
 from urllib.parse import urlparse
 
@@ -22,9 +24,15 @@ from backend.services.fetch_html import (
     format_fetch_error_hebrew,
     normalize_fetch_strategy,
 )
+from backend.services.competitor_lightweight_precheck import LightweightCheckOutcome, lightweight_check
+from backend.services.price_resolve_lightweight_gate import (
+    apply_price_resolve_lightweight_decision,
+    persist_resolve_url_cache_after_heavy_fetch,
+)
 from backend.services.resolve_cache import get_cache, put_cache
 
 router = APIRouter(prefix="/api/price", tags=["price"])
+logger = logging.getLogger(__name__)
 
 
 class ResolveIn(BaseModel):
@@ -57,6 +65,43 @@ async def run_price_resolve(session: Session, url_raw: str, *, ignore_saved_sele
     domain = normalize_domain(url)
     learned: str | None = None
     saved = session.get(DomainPriceSelector, domain)
+    lw_snapshot = None
+
+    if saved and not ignore_saved_selector:
+        try:
+            sel_gate = (saved.css_selector or "").strip()
+            if not sel_gate:
+                lw_snapshot = None
+                gate = apply_price_resolve_lightweight_decision(
+                    session,
+                    url=url,
+                    domain=domain,
+                    css_selector="",
+                    learned_selector_label=saved.css_selector,
+                    lw=LightweightCheckOutcome(ok=False),
+                )
+            else:
+                lw_snapshot = await asyncio.to_thread(lightweight_check, url, sel_gate)
+                gate = apply_price_resolve_lightweight_decision(
+                    session,
+                    url=url,
+                    domain=domain,
+                    css_selector=sel_gate,
+                    learned_selector_label=saved.css_selector,
+                    lw=lw_snapshot,
+                )
+            if gate.resolve_out_dict is not None:
+                return ResolveOut(**gate.resolve_out_dict)
+            if gate.fallback_to_playwright_reason:
+                logger.warning(
+                    "price_resolve_heavy_fetch_start url=%s prior_gate_reason=%s",
+                    url,
+                    gate.fallback_to_playwright_reason,
+                )
+        except Exception:
+            lw_snapshot = None
+            logger.debug("price_resolve_lightweight_gate_exception url=%s", url, exc_info=True)
+
     if saved and not ignore_saved_selector:
         strat = normalize_fetch_strategy(getattr(saved, "fetch_strategy", None))
         try:
@@ -65,6 +110,17 @@ async def run_price_resolve(session: Session, url_raw: str, *, ignore_saved_sele
             if price_fast:
                 learned = saved.css_selector
                 token = put_cache(html_fast, url)
+                try:
+                    persist_resolve_url_cache_after_heavy_fetch(
+                        session,
+                        url=url,
+                        domain=domain,
+                        price=price_fast,
+                        html=html_fast,
+                        lw_snapshot=lw_snapshot,
+                    )
+                except Exception:
+                    logger.debug("persist_resolve_url_cache failed url=%s", url, exc_info=True)
                 return ResolveOut(
                     url=url,
                     domain=domain,
@@ -91,6 +147,17 @@ async def run_price_resolve(session: Session, url_raw: str, *, ignore_saved_sele
         if price:
             learned = saved.css_selector
             token = put_cache(html, url)
+            try:
+                persist_resolve_url_cache_after_heavy_fetch(
+                    session,
+                    url=url,
+                    domain=domain,
+                    price=price,
+                    html=html,
+                    lw_snapshot=lw_snapshot,
+                )
+            except Exception:
+                logger.debug("persist_resolve_url_cache failed url=%s", url, exc_info=True)
             return ResolveOut(
                 url=url,
                 domain=domain,
@@ -105,10 +172,23 @@ async def run_price_resolve(session: Session, url_raw: str, *, ignore_saved_sele
 
     result = run_extraction_pipeline(html)
     token = put_cache(html, url)
+    out_price = result.get("price")
+    if out_price is not None:
+        try:
+            persist_resolve_url_cache_after_heavy_fetch(
+                session,
+                url=url,
+                domain=domain,
+                price=float(out_price),
+                html=html,
+                lw_snapshot=lw_snapshot,
+            )
+        except Exception:
+            logger.debug("persist_resolve_url_cache failed url=%s", url, exc_info=True)
     return ResolveOut(
         url=url,
         domain=domain,
-        price=result.get("price"),
+        price=out_price,
         currency=result.get("currency"),
         source=result.get("source"),
         learned_selector=None,
