@@ -92,6 +92,34 @@ _BLOCK_MARKERS_BROWSERLESS = (
     "cloudflare ray id",
 )
 
+_PLAYWRIGHT_PROXY_BLOCKED_RESOURCE_TYPES = frozenset(
+    {
+        "image",
+        "media",
+        "font",
+        "websocket",
+    },
+)
+
+_PLAYWRIGHT_PROXY_BLOCKED_DOMAINS = frozenset(
+    {
+        "google-analytics.com",
+        "googletagmanager.com",
+        "doubleclick.net",
+        "connect.facebook.net",
+        "facebook.com/tr",
+        "hotjar.com",
+        "clarity.ms",
+        "segment.com",
+        "mixpanel.com",
+        "amplitude.com",
+        "intercom.io",
+        "drift.com",
+        "tawk.to",
+        "zendesk.com",
+    },
+)
+
 
 def _origin_root(url: str) -> str:
     from urllib.parse import urlparse
@@ -331,6 +359,22 @@ def _classify_browserless_page(html: str | None) -> str:
     return "unknown_html"
 
 
+def _is_blocked_url_for_playwright_proxy(url: str) -> bool:
+    low = (url or "").lower()
+    return any(d in low for d in _PLAYWRIGHT_PROXY_BLOCKED_DOMAINS)
+
+
+async def _playwright_proxy_route_interceptor(route) -> None:
+    req = route.request
+    if req.resource_type in _PLAYWRIGHT_PROXY_BLOCKED_RESOURCE_TYPES:
+        await route.abort()
+        return
+    if _is_blocked_url_for_playwright_proxy(req.url):
+        await route.abort()
+        return
+    await route.continue_()
+
+
 def _browserless_payload_candidates(url: str, *, proxy_mode: bool) -> list[dict[str, object]]:
     # Keep payloads conservative and fast on blocked-site path.
     base: list[dict[str, object]] = [
@@ -357,6 +401,111 @@ def _fallback_stage_timeout(timeout: float, *, proxy: bool) -> float:
     """Bound fallback time on blocked sites so worker threads are freed quickly."""
     cap = 10.0 if proxy else 12.0
     return min(float(timeout), cap)
+
+
+def _playwright_proxy_settings_from_env() -> dict[str, str] | None:
+    server = (os.getenv("PROXY_SERVER") or "").strip()
+    username = (os.getenv("PROXY_USERNAME") or "").strip()
+    password = (os.getenv("PROXY_PASSWORD") or "").strip()
+    if not server:
+        return None
+    if not server.startswith("http://") and not server.startswith("https://"):
+        server = f"http://{server}"
+    out = {"server": server}
+    if username:
+        out["username"] = username
+    if password:
+        out["password"] = password
+    return out
+
+
+async def fetch_html_playwright_proxy(url: str, timeout: float = 10.0) -> str:
+    """
+    Proxy fallback using Playwright + external proxy provider.
+    This replaces the previous Browserless built-in proxy stage.
+    """
+    proxy_settings = _playwright_proxy_settings_from_env()
+    if not proxy_settings:
+        raise FetchHtmlError("PROXY_SERVER missing for playwright proxy fallback")
+
+    stage = "playwright_proxy"
+    log.warning(
+        "fetch stage=%s starting proxy_server=%s timeout=%ss url=%s",
+        stage,
+        proxy_settings.get("server", "-"),
+        timeout,
+        url,
+    )
+    try:
+        from playwright.async_api import async_playwright
+    except Exception as ex:
+        raise FetchHtmlError(
+            "Playwright is not available; install playwright and browser binaries",
+            final_reason=str(ex),
+        ) from ex
+
+    html = ""
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=True,
+                proxy=proxy_settings,
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-dev-shm-usage",
+                    "--no-sandbox",
+                    "--disable-gpu",
+                    "--disable-extensions",
+                    "--disable-background-networking",
+                    "--disable-sync",
+                    "--no-first-run",
+                ],
+            )
+            context = await browser.new_context(
+                viewport={"width": 1440, "height": 900},
+                user_agent=CHROME_WINDOWS_UA,
+                locale="he-IL",
+                timezone_id="Asia/Jerusalem",
+                java_script_enabled=True,
+            )
+            await context.add_init_script(
+                """
+                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3,4,5] });
+                Object.defineProperty(navigator, 'languages', { get: () => ['he-IL','he','en-US','en'] });
+                """,
+            )
+            page = await context.new_page()
+            await page.route("**/*", _playwright_proxy_route_interceptor)
+            resp = await page.goto(url, wait_until="domcontentloaded", timeout=int(timeout * 1000))
+            status = resp.status if resp else None
+            html = await page.content()
+            preview = _safe_html_preview(html, 300)
+            markers = _blocked_markers_found(html)
+            blocked = _is_blocked_browserless_html(html)
+            page_class = _classify_browserless_page(html)
+            log.warning(
+                "proxy_response stage=%s status=%s html_len=%s page_class=%s blocked=%s markers=%s preview=%s",
+                stage,
+                status,
+                len(html or ""),
+                page_class,
+                blocked,
+                ",".join(markers) if markers else "-",
+                preview,
+            )
+            await page.close()
+            await context.close()
+            await browser.close()
+            if status in (403, 429):
+                raise FetchHtmlError(f"Playwright proxy HTTP {status}", status_code=status)
+            if blocked:
+                raise FetchHtmlError("Playwright proxy blocked/empty html", status_code=403)
+            return html
+    except FetchHtmlError:
+        raise
+    except Exception as ex:
+        raise FetchHtmlError(str(ex) or "playwright proxy error", status_code=408) from ex
 
 
 def fetch_html_browserless(url: str, use_proxy: bool = False, timeout: float = 45.0) -> str:
@@ -518,14 +667,14 @@ def fetch_html_sync_with_fallback(url: str, timeout: float = 45.0) -> str:
         except Exception as e2:
             bl_proxy_timeout = _fallback_stage_timeout(timeout, proxy=True)
             log.warning(
-                "fallback triggered stage=browserless url=%s err=%s next_stage=browserless_proxy timeout=%ss",
+                "fallback triggered stage=browserless url=%s err=%s next_stage=playwright_proxy timeout=%ss",
                 url,
                 e2,
                 bl_proxy_timeout,
             )
             proxy_attempted = True
             try:
-                return fetch_html_browserless(url, use_proxy=True, timeout=bl_proxy_timeout)
+                return asyncio.run(fetch_html_playwright_proxy(url, timeout=bl_proxy_timeout))
             except Exception as e3:
                 log.error(
                     "fetch failed all stages url=%s proxy_attempted=%s final_reason=%s",
@@ -571,14 +720,14 @@ async def fetch_html_with_fallback(url: str, timeout: float = 45.0) -> str:
         except Exception as e2:
             bl_proxy_timeout = _fallback_stage_timeout(timeout, proxy=True)
             log.warning(
-                "fallback triggered stage=browserless url=%s err=%s next_stage=browserless_proxy timeout=%ss",
+                "fallback triggered stage=browserless url=%s err=%s next_stage=playwright_proxy timeout=%ss",
                 url,
                 e2,
                 bl_proxy_timeout,
             )
             proxy_attempted = True
             try:
-                return await asyncio.to_thread(fetch_html_browserless, url, True, bl_proxy_timeout)
+                return await fetch_html_playwright_proxy(url, timeout=bl_proxy_timeout)
             except Exception as e3:
                 log.error(
                     "fetch failed all stages url=%s proxy_attempted=%s final_reason=%s",
