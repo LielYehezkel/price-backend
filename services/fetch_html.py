@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 
 import httpx
 
@@ -103,6 +104,9 @@ _PLAYWRIGHT_PROXY_BLOCKED_RESOURCE_TYPES = frozenset(
         "media",
         "font",
         "websocket",
+        "manifest",
+        "eventsource",
+        "beacon",
     },
 )
 
@@ -439,6 +443,58 @@ async def _playwright_proxy_route_interceptor(route) -> None:
     await route.continue_()
 
 
+def _root_host(host: str | None) -> str:
+    h = (host or "").lower().strip()
+    if h.startswith("www."):
+        h = h[4:]
+    return h
+
+
+def _is_same_site(host: str | None, target_root: str) -> bool:
+    h = _root_host(host)
+    if not h or not target_root:
+        return False
+    return h == target_root or h.endswith("." + target_root)
+
+
+_HEAVY_ASSET_RE = re.compile(
+    r"\.(?:png|jpe?g|webp|gif|svg|ico|mp4|webm|mp3|woff2?|ttf|otf|map)(?:[\?#]|$)",
+    re.I,
+)
+
+
+def _build_playwright_proxy_route_interceptor(target_url: str):
+    from urllib.parse import urlparse
+
+    target_root = _root_host(urlparse(target_url).hostname)
+
+    async def _handler(route) -> None:
+        req = route.request
+        req_url = req.url or ""
+        req_low = req_url.lower()
+        req_host = urlparse(req_url).hostname
+
+        if req.resource_type in _PLAYWRIGHT_PROXY_BLOCKED_RESOURCE_TYPES:
+            await route.abort()
+            return
+        if _HEAVY_ASSET_RE.search(req_low):
+            await route.abort()
+            return
+        if _is_blocked_url_for_playwright_proxy(req_url):
+            await route.abort()
+            return
+
+        # Aggressive bandwidth saving on proxy path:
+        # block third-party domains and keep same-site traffic only.
+        if target_root and req_host and not _is_same_site(req_host, target_root):
+            await route.abort()
+            return
+
+        await route.continue_()
+
+    return _handler
+
+
 def _browserless_payload_candidates(url: str, *, proxy_mode: bool) -> list[dict[str, object]]:
     # Keep payloads conservative and fast on blocked-site path.
     base: list[dict[str, object]] = [
@@ -534,6 +590,9 @@ async def fetch_html_playwright_proxy(url: str, timeout: float = 10.0) -> str:
         ) from ex
 
     html = ""
+    browser = None
+    context = None
+    page = None
     try:
         async with async_playwright() as p:
             log.warning("playwright_proxy launching_chromium url=%s", url)
@@ -572,7 +631,7 @@ async def fetch_html_playwright_proxy(url: str, timeout: float = 10.0) -> str:
             )
             page = await context.new_page()
             log.warning("playwright_proxy page_opened url=%s", url)
-            await page.route("**/*", _playwright_proxy_route_interceptor)
+            await page.route("**/*", _build_playwright_proxy_route_interceptor(url))
             log.warning("playwright_proxy route_interceptor_enabled url=%s", url)
             nav_timeout_ms = max(int(timeout * 1000), 8_000)
             log.warning(
@@ -625,9 +684,6 @@ async def fetch_html_playwright_proxy(url: str, timeout: float = 10.0) -> str:
                 ",".join(markers) if markers else "-",
                 preview,
             )
-            await page.close()
-            await context.close()
-            await browser.close()
             if status in (403, 429, 503):
                 raise FetchHtmlError(f"Playwright proxy HTTP {status}", status_code=status)
             # Soft-block signals on HTTP 200 are not fatal: return HTML and let extraction decide.
@@ -648,6 +704,23 @@ async def fetch_html_playwright_proxy(url: str, timeout: float = 10.0) -> str:
             _PLAYWRIGHT_PROXY_DISABLED_REASON = str(ex)
             log.error("playwright_proxy disabled for process reason=%s", _PLAYWRIGHT_PROXY_DISABLED_REASON)
         raise FetchHtmlError(str(ex) or "playwright proxy error", status_code=408) from ex
+    finally:
+        # Always cleanup to avoid lingering traffic and memory.
+        try:
+            if page is not None:
+                await page.close()
+        except Exception:
+            pass
+        try:
+            if context is not None:
+                await context.close()
+        except Exception:
+            pass
+        try:
+            if browser is not None:
+                await browser.close()
+        except Exception:
+            pass
 
 
 def fetch_html_browserless(url: str, use_proxy: bool = False, timeout: float = 45.0) -> str:
