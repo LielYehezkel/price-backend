@@ -134,6 +134,26 @@ def _migrate_shop_setup_and_pricing_strategy() -> None:
             pass
 
 
+def _migrate_competitor_link_light_html_hash() -> None:
+    with engine.begin() as conn:
+        try:
+            conn.execute(text("ALTER TABLE competitorlink ADD COLUMN last_light_html_hash VARCHAR(64)"))
+        except Exception as ex:
+            if not _is_duplicate_column_error(ex):
+                log.warning("Migration failed: competitorlink.last_light_html_hash: %s", ex)
+
+
+def _migrate_domain_price_selector_fetch_strategy() -> None:
+    with engine.begin() as conn:
+        try:
+            conn.execute(
+                text("ALTER TABLE domainpriceselector ADD COLUMN fetch_strategy VARCHAR DEFAULT 'http'"),
+            )
+        except Exception as ex:
+            if not _is_duplicate_column_error(ex):
+                log.warning("Migration failed: domainpriceselector.fetch_strategy: %s", ex)
+
+
 def _backfill_tracked_competitors() -> None:
     from backend.models import CompetitorLink, Product, TrackedCompetitor
     from backend.services.domain_policy import domain_from_url
@@ -233,6 +253,8 @@ def init_db() -> None:
     _ensure_price_sanity_defaults()
     _ensure_scheduler_heartbeat_row()
     _ensure_admin_system_config_row()
+    _migrate_competitor_link_light_html_hash()
+    _migrate_domain_price_selector_fetch_strategy()
     _backfill_tracked_competitors()
 
 

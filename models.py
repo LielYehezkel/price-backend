@@ -98,6 +98,8 @@ class CompetitorLink(SQLModel, table=True):
     last_price: Optional[float] = None
     last_currency: Optional[str] = None
     last_checked_at: Optional[datetime] = None
+    # hash SHA256 (hex) של 50KB ראשונים מ-GET קל — השוואה כשאין חילוץ מחיר בprecheck
+    last_light_html_hash: Optional[str] = Field(default=None, max_length=64)
 
 
 class PriceSnapshot(SQLModel, table=True):
@@ -175,6 +177,8 @@ class DomainPriceSelector(SQLModel, table=True):
     domain: str = Field(primary_key=True)
     css_selector: str
     alternates_json: Optional[str] = None
+    # איך למשוך דפים לדומיין הזה אחרי שלמדנו סלקטור: http | playwright_proxy
+    fetch_strategy: str = Field(default="http")
     updated_at: datetime = Field(default_factory=utcnow)
 
 

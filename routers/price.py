@@ -17,9 +17,10 @@ from backend.services.extract import (
 from backend.services.fetch_html import (
     FetchHtmlError,
     fetch_error_api_status,
-    fetch_html,
-    fetch_html_no_fallback,
+    fetch_html_for_saved_strategy,
+    fetch_html_with_fallback_meta,
     format_fetch_error_hebrew,
+    normalize_fetch_strategy,
 )
 from backend.services.resolve_cache import get_cache, put_cache
 
@@ -39,6 +40,8 @@ class ResolveOut(BaseModel):
     learned_selector: str | None
     candidates: list[dict[str, Any]]
     resolution_token: str | None
+    # אסטרטגיית המשיכה ששימשה ל-HTML של תשובה זו — לשליחה בחזרה ב-/confirm
+    fetch_strategy_used: str | None = None
 
 
 def _validate_url(raw: str) -> str:
@@ -55,9 +58,9 @@ async def run_price_resolve(session: Session, url_raw: str, *, ignore_saved_sele
     learned: str | None = None
     saved = session.get(DomainPriceSelector, domain)
     if saved and not ignore_saved_selector:
-        # Fast path: for known domain selector, try cheap fetch first (no heavy fallback chain).
+        strat = normalize_fetch_strategy(getattr(saved, "fetch_strategy", None))
         try:
-            html_fast = await fetch_html_no_fallback(url, timeout=12.0)
+            html_fast = await fetch_html_for_saved_strategy(url, strat, timeout_normal=12.0)
             price_fast = apply_saved_selector(html_fast, saved.css_selector)
             if price_fast:
                 learned = saved.css_selector
@@ -71,13 +74,15 @@ async def run_price_resolve(session: Session, url_raw: str, *, ignore_saved_sele
                     learned_selector=learned,
                     candidates=[],
                     resolution_token=token,
+                    fetch_strategy_used=strat,
                 )
         except Exception:
-            # Any fast-path failure falls back to existing full flow below.
             pass
 
     try:
-        html = await fetch_html(url)
+        fetched = await fetch_html_with_fallback_meta(url)
+        html = fetched.html
+        strat_used = fetched.strategy
     except FetchHtmlError as e:
         raise HTTPException(fetch_error_api_status(e), format_fetch_error_hebrew(e)) from None
 
@@ -95,6 +100,7 @@ async def run_price_resolve(session: Session, url_raw: str, *, ignore_saved_sele
                 learned_selector=learned,
                 candidates=[],
                 resolution_token=token,
+                fetch_strategy_used=strat_used,
             )
 
     result = run_extraction_pipeline(html)
@@ -108,6 +114,7 @@ async def run_price_resolve(session: Session, url_raw: str, *, ignore_saved_sele
         learned_selector=None,
         candidates=result.get("candidates") or [],
         resolution_token=token,
+        fetch_strategy_used=strat_used,
     )
 
 
@@ -124,6 +131,15 @@ class ConfirmIn(BaseModel):
     css_selector: str
     resolution_token: str | None = None
     selector_alternates: list[str] | None = None
+    fetch_strategy: str | None = None  # http | playwright_proxy (מ-resolve או ידני)
+
+
+def _confirm_fetch_strategy_value(body: ConfirmIn, existing: DomainPriceSelector | None) -> str:
+    if body.fetch_strategy is not None and str(body.fetch_strategy).strip():
+        return normalize_fetch_strategy(body.fetch_strategy)
+    if existing is not None and getattr(existing, "fetch_strategy", None):
+        return normalize_fetch_strategy(existing.fetch_strategy)
+    return normalize_fetch_strategy(None)
 
 
 @router.post("/confirm")
@@ -135,6 +151,9 @@ async def confirm_selector(
     url = _validate_url(raw_url.strip())
     domain = normalize_domain(url)
 
+    row_existing = session.get(DomainPriceSelector, domain)
+    strat_save = _confirm_fetch_strategy_value(body, row_existing)
+
     html: str
     if body.resolution_token:
         cached = get_cache(body.resolution_token)
@@ -143,7 +162,9 @@ async def confirm_selector(
         html = cached.html
     else:
         try:
-            html = await fetch_html(url)
+            fetched = await fetch_html_with_fallback_meta(url)
+            html = fetched.html
+            strat_save = fetched.strategy
         except FetchHtmlError as e:
             raise HTTPException(fetch_error_api_status(e), format_fetch_error_hebrew(e)) from None
 
@@ -157,6 +178,7 @@ async def confirm_selector(
     if row:
         row.css_selector = used or body.css_selector
         row.alternates_json = alts_json
+        row.fetch_strategy = strat_save
         session.add(row)
     else:
         session.add(
@@ -164,6 +186,7 @@ async def confirm_selector(
                 domain=domain,
                 css_selector=used or body.css_selector,
                 alternates_json=alts_json,
+                fetch_strategy=strat_save,
             )
         )
     session.commit()

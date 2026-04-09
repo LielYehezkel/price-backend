@@ -21,10 +21,16 @@ from backend.models import (
     utcnow,
 )
 from backend.services.auto_pricing import maybe_apply_auto_pricing
+from backend.services.competitor_lightweight_precheck import try_competitor_lightweight_precheck_skip
 from backend.services.domain_policy import domain_from_url, domain_is_live
 from backend.services.scan_engine_journal import append_operational_log_safe, classify_competitor_scan_failure
 from backend.services.extract import apply_saved_selector, run_extraction_pipeline
-from backend.services.fetch_html import FetchHtmlError, fetch_html_sync, fetch_html_sync_no_fallback
+from backend.services.fetch_html import (
+    FetchHtmlError,
+    fetch_html_for_saved_strategy_sync,
+    fetch_html_sync,
+    normalize_fetch_strategy,
+)
 from backend.services.price_sanity import validate_competitor_price
 from backend.services.woo_sync import effective_wc_price, fetch_wc_product_by_id
 
@@ -157,13 +163,35 @@ def run_competitor_check(session: Session, competitor_id: int) -> CompetitorChec
     domain = domain_from_url(comp.url)
     live = domain_is_live(session, domain)
     saved = session.get(DomainPriceSelector, domain) if live else None
+
+    lw_hash_for_persist: str | None = None
+    if live and saved:
+        try:
+            early_skip, lw_ht = try_competitor_lightweight_precheck_skip(
+                session, shop, product, comp, domain, saved, prev_comp,
+            )
+            if early_skip is not None:
+                return CompetitorCheckResult(
+                    price=early_skip.price,
+                    currency=early_skip.currency,
+                    published=early_skip.published,
+                )
+            lw_hash_for_persist = lw_ht
+        except Exception:
+            lw_hash_for_persist = None
+
     html_fast: str | None = None
     fast_price: float | None = None
 
-    # Fast path for known domains: cheap fetch (no heavy fallback) + saved selector match.
+    # Fast path: ישירות לפי fetch_strategy שמור; כשל → שרשרת מלאה למטה.
     if saved:
         try:
-            html_fast = fetch_html_sync_no_fallback(comp.url, timeout=12.0)
+            strat = normalize_fetch_strategy(getattr(saved, "fetch_strategy", None))
+            html_fast = fetch_html_for_saved_strategy_sync(
+                comp.url,
+                strat,
+                timeout_normal=12.0,
+            )
             fast_price = apply_saved_selector(html_fast, saved.css_selector)
             if fast_price is not None:
                 logger.info("competitor_fast_path_hit link=%s domain=%s", comp.id, domain)
@@ -358,6 +386,8 @@ def run_competitor_check(session: Session, competitor_id: int) -> CompetitorChec
     comp.last_price = price
     comp.last_currency = cur
     comp.last_checked_at = utcnow()
+    if lw_hash_for_persist:
+        comp.last_light_html_hash = lw_hash_for_persist
     session.add(comp)
 
     if price is not None and our is not None and price < our - 0.01:

@@ -6,10 +6,28 @@ import asyncio
 import logging
 import os
 import re
+from dataclasses import dataclass
 
 import httpx
 
 log = logging.getLogger(__name__)
+
+# אסטרטגיית משיכה לדומיין עם סלקטור שמור / מטא־תשובת resolve
+FETCH_STRATEGY_HTTP = "http"
+FETCH_STRATEGY_PLAYWRIGHT_PROXY = "playwright_proxy"
+
+
+@dataclass(frozen=True)
+class FetchedHtml:
+    html: str
+    strategy: str
+
+
+def normalize_fetch_strategy(raw: str | None) -> str:
+    s = (raw or "").strip().lower()
+    if s == FETCH_STRATEGY_PLAYWRIGHT_PROXY:
+        return FETCH_STRATEGY_PLAYWRIGHT_PROXY
+    return FETCH_STRATEGY_HTTP
 
 
 class FetchHtmlError(Exception):
@@ -32,7 +50,7 @@ class FetchHtmlError(Exception):
 def format_fetch_error_hebrew(e: FetchHtmlError) -> str:
     if e.api_status_code and e.api_status_code != 502:
         return (
-            "האתר חסם גם את המשיכה הרגילה וגם את ניסיונות ה-fallback (כולל proxy). "
+            "האתר חסם גם את המשיכה הרגילה וגם את ניסיון ה-proxy (Playwright). "
             "זו חסימה בצד אתר היעד. נסו שוב מאוחר יותר או מהדפדפן המקומי."
         )
     """הודעה ללקוח API (502) — לא לזרוק 500 על חסימת WAF."""
@@ -316,12 +334,12 @@ async def _fetch_html_primary(url: str, timeout: float = 45.0) -> str:
 
 
 def fetch_html_sync_no_fallback(url: str, timeout: float = 12.0) -> str:
-    """Cheap path: normal fetch only (no browserless/playwright fallback)."""
+    """Cheap path: normal HTTP/TLS fetch only (no Playwright fallback)."""
     return _fetch_html_primary_sync(url, timeout=timeout)
 
 
 async def fetch_html_no_fallback(url: str, timeout: float = 12.0) -> str:
-    """Cheap async path: normal fetch only (no fallback chain)."""
+    """Cheap async path: normal fetch only (no Playwright fallback)."""
     return await _fetch_html_primary(url, timeout=timeout)
 
 
@@ -505,18 +523,6 @@ def _build_playwright_proxy_route_interceptor(target_url: str):
     return _handler
 
 
-def _browserless_payload_candidates(url: str, *, proxy_mode: bool) -> list[dict[str, object]]:
-    # Keep payloads conservative and fast on blocked-site path.
-    base: list[dict[str, object]] = [
-        {"url": url, "bestAttempt": True},
-        {"url": url, "bestAttempt": True, "gotoOptions": {"waitUntil": "domcontentloaded"}},
-    ]
-    # networkidle2 is slower; use it only on non-proxy stage as a last try.
-    if not proxy_mode:
-        base.append({"url": url, "bestAttempt": True, "gotoOptions": {"waitUntil": "networkidle2"}})
-    return base
-
-
 def _is_blocking_error(e: Exception) -> bool:
     if isinstance(e, FetchHtmlError):
         if e.status_code in (403, 429):
@@ -564,10 +570,7 @@ def _playwright_proxy_is_disabled() -> bool:
 
 
 async def fetch_html_playwright_proxy(url: str, timeout: float = 10.0) -> str:
-    """
-    Proxy fallback using Playwright + external proxy provider.
-    This replaces the previous Browserless built-in proxy stage.
-    """
+    """משיכת HTML דרך Playwright + פרוקסי חיצוני (PROXY_SERVER)."""
     global _PLAYWRIGHT_PROXY_DISABLED_REASON
     if _playwright_proxy_is_disabled():
         log.warning(
@@ -769,138 +772,7 @@ async def fetch_html_playwright_proxy(url: str, timeout: float = 10.0) -> str:
             pass
 
 
-def fetch_html_browserless(url: str, use_proxy: bool = False, timeout: float = 45.0) -> str:
-    token = (os.getenv("BROWSERLESS_TOKEN") or "").strip()
-    if not token:
-        raise FetchHtmlError("Browserless token missing")
-
-    endpoint = f"https://production-sfo.browserless.io/content?token={token}"
-    if use_proxy:
-        # Browserless expects proxy flags in query params, not JSON body.
-        endpoint = f"{endpoint}&proxy=residential"
-    stage = "browserless_proxy" if use_proxy else "browserless"
-    log.warning(
-        "fetch stage=%s starting endpoint_has_proxy=%s timeout=%ss url=%s",
-        stage,
-        use_proxy,
-        timeout,
-        url,
-    )
-    last_err: FetchHtmlError | None = None
-    payloads = _browserless_payload_candidates(url, proxy_mode=use_proxy)
-    try:
-        req_timeout = httpx.Timeout(connect=min(6.0, timeout), read=timeout, write=min(8.0, timeout), pool=5.0)
-        with httpx.Client(timeout=req_timeout, follow_redirects=True, trust_env=True) as client:
-            for i, payload in enumerate(payloads, start=1):
-                log.info(
-                    "browserless request stage=%s attempt=%s proxy_requested=%s proxy_mode=%s url=%s",
-                    stage,
-                    i,
-                    use_proxy,
-                    "residential(query)" if use_proxy else "none",
-                    url,
-                )
-                try:
-                    r = client.post(endpoint, json=payload)
-                except httpx.ReadTimeout as ex:
-                    log.warning(
-                        "fetch stage=%s attempt=%s read_timeout=%ss proxy_mode=%s url=%s",
-                        stage,
-                        i,
-                        timeout,
-                        "residential(query)" if use_proxy else "none",
-                        url,
-                    )
-                    last_err = FetchHtmlError(str(ex) or "Browserless read timeout", status_code=408)
-                    continue
-                log.info("fetch stage=%s attempt=%s status=%s url=%s", stage, i, r.status_code, url)
-                if use_proxy:
-                    log.warning(
-                        "proxy_response stage=%s attempt=%s status=%s url=%s",
-                        stage,
-                        i,
-                        r.status_code,
-                        url,
-                    )
-                if r.status_code == 400:
-                    body_sample = (r.text or "")[:220].replace("\n", " ").strip()
-                    log.warning(
-                        "fetch stage=%s attempt=%s bad_request body=%s",
-                        stage,
-                        i,
-                        body_sample,
-                    )
-                    # Do not retry repeated invalid schema requests.
-                    if "validation failed" in body_sample.lower() or "not allowed" in body_sample.lower():
-                        raise FetchHtmlError(
-                            "Browserless request validation failed",
-                            status_code=400,
-                            final_reason=body_sample,
-                        )
-                    last_err = FetchHtmlError("Browserless HTTP 400", status_code=400, final_reason=body_sample)
-                    continue
-                if r.status_code == 401 and use_proxy:
-                    body_sample = (r.text or "")[:220].replace("\n", " ").strip()
-                    raise FetchHtmlError(
-                        "Browserless proxy may be unsupported by current plan",
-                        status_code=401,
-                        final_reason=body_sample,
-                    )
-                if r.status_code >= 400:
-                    raise FetchHtmlError(f"Browserless HTTP {r.status_code}", status_code=r.status_code)
-                html = r.text or ""
-                markers = _blocked_markers_found(html)
-                blocked = _is_blocked_browserless_html(html)
-                classification = _classify_browserless_page(html)
-                preview = _safe_html_preview(html, 300)
-                log.info(
-                    "fetch stage=%s attempt=%s html_len=%s blocked=%s page_class=%s markers=%s proxy_mode=%s url=%s",
-                    stage,
-                    i,
-                    len(html),
-                    blocked,
-                    classification,
-                    ",".join(markers) if markers else "-",
-                    "residential(query)" if use_proxy else "none",
-                    url,
-                )
-                log.info(
-                    "fetch stage=%s attempt=%s html_preview=%s",
-                    stage,
-                    i,
-                    preview,
-                )
-                if use_proxy:
-                    log.warning(
-                        "proxy_response stage=%s attempt=%s html_len=%s page_class=%s blocked=%s markers=%s preview=%s",
-                        stage,
-                        i,
-                        len(html),
-                        classification,
-                        blocked,
-                        ",".join(markers) if markers else "-",
-                        preview,
-                    )
-                if blocked:
-                    last_err = FetchHtmlError(
-                        "Browserless blocked/empty html",
-                        status_code=403,
-                        final_reason=f"stage={stage};len={len(html)};markers={markers}",
-                    )
-                    continue
-                return html
-    except FetchHtmlError:
-        raise
-    except httpx.RequestError as e:
-        raise FetchHtmlError(str(e) or "browserless network error") from e
-    if last_err is not None:
-        raise last_err
-    raise FetchHtmlError("Browserless failed with unknown reason", status_code=500)
-
-
-def fetch_html_sync_with_fallback(url: str, timeout: float = 45.0) -> str:
-    token = (os.getenv("BROWSERLESS_TOKEN") or "").strip()
-    proxy_attempted = False
+def fetch_html_sync_with_fallback_meta(url: str, timeout: float = 45.0) -> FetchedHtml:
     try:
         log.info("fetch stage=normal url=%s", url)
         html = _fetch_html_primary_sync(url, timeout=timeout)
@@ -913,47 +785,40 @@ def fetch_html_sync_with_fallback(url: str, timeout: float = 45.0) -> str:
             ",".join(markers) if markers else "-",
             url,
         )
-        return html
+        return FetchedHtml(html=html, strategy=FETCH_STRATEGY_HTTP)
     except Exception as e:
         if not _is_blocking_error(e):
             raise
         log.warning("fallback triggered stage=normal url=%s err=%s", url, e)
-        if not token:
-            log.warning("BROWSERLESS_TOKEN missing; skipping browserless fallback url=%s", url)
+        if not _playwright_proxy_settings_from_env():
+            log.warning("playwright_proxy skipped PROXY_SERVER missing url=%s", url)
             if isinstance(e, Exception):
                 raise e
-        bl_timeout = _fallback_stage_timeout(timeout, proxy=False)
+        bl_proxy_timeout = _fallback_stage_timeout(timeout, proxy=True)
+        log.warning(
+            "fallback next_stage=playwright_proxy timeout=%ss url=%s",
+            bl_proxy_timeout,
+            url,
+        )
         try:
-            return fetch_html_browserless(url, use_proxy=False, timeout=bl_timeout)
-        except Exception as e2:
-            bl_proxy_timeout = _fallback_stage_timeout(timeout, proxy=True)
-            log.warning(
-                "fallback triggered stage=browserless url=%s err=%s next_stage=playwright_proxy timeout=%ss",
+            html = asyncio.run(fetch_html_playwright_proxy(url, timeout=bl_proxy_timeout))
+            return FetchedHtml(html=html, strategy=FETCH_STRATEGY_PLAYWRIGHT_PROXY)
+        except Exception as e3:
+            log.error(
+                "fetch failed all stages url=%s proxy_attempted=%s final_reason=%s",
                 url,
-                e2,
-                bl_proxy_timeout,
+                True,
+                e3,
             )
-            proxy_attempted = True
-            try:
-                return asyncio.run(fetch_html_playwright_proxy(url, timeout=bl_proxy_timeout))
-            except Exception as e3:
-                log.error(
-                    "fetch failed all stages url=%s proxy_attempted=%s final_reason=%s",
-                    url,
-                    proxy_attempted,
-                    e3,
-                )
-                raise FetchHtmlError(
-                    "all_fetch_stages_blocked",
-                    status_code=403,
-                    api_status_code=424,
-                    final_reason=str(e3),
-                ) from e3
+            raise FetchHtmlError(
+                "all_fetch_stages_blocked",
+                status_code=403,
+                api_status_code=424,
+                final_reason=str(e3),
+            ) from e3
 
 
-async def fetch_html_with_fallback(url: str, timeout: float = 45.0) -> str:
-    token = (os.getenv("BROWSERLESS_TOKEN") or "").strip()
-    proxy_attempted = False
+async def fetch_html_with_fallback_meta(url: str, timeout: float = 45.0) -> FetchedHtml:
     try:
         log.info("fetch stage=normal url=%s", url)
         html = await _fetch_html_primary(url, timeout=timeout)
@@ -966,42 +831,72 @@ async def fetch_html_with_fallback(url: str, timeout: float = 45.0) -> str:
             ",".join(markers) if markers else "-",
             url,
         )
-        return html
+        return FetchedHtml(html=html, strategy=FETCH_STRATEGY_HTTP)
     except Exception as e:
         if not _is_blocking_error(e):
             raise
         log.warning("fallback triggered stage=normal url=%s err=%s", url, e)
-        if not token:
-            log.warning("BROWSERLESS_TOKEN missing; skipping browserless fallback url=%s", url)
+        if not _playwright_proxy_settings_from_env():
+            log.warning("playwright_proxy skipped PROXY_SERVER missing url=%s", url)
             if isinstance(e, Exception):
                 raise e
-        bl_timeout = _fallback_stage_timeout(timeout, proxy=False)
+        bl_proxy_timeout = _fallback_stage_timeout(timeout, proxy=True)
+        log.warning(
+            "fallback next_stage=playwright_proxy timeout=%ss url=%s",
+            bl_proxy_timeout,
+            url,
+        )
         try:
-            return await asyncio.to_thread(fetch_html_browserless, url, False, bl_timeout)
-        except Exception as e2:
-            bl_proxy_timeout = _fallback_stage_timeout(timeout, proxy=True)
-            log.warning(
-                "fallback triggered stage=browserless url=%s err=%s next_stage=playwright_proxy timeout=%ss",
+            html = await fetch_html_playwright_proxy(url, timeout=bl_proxy_timeout)
+            return FetchedHtml(html=html, strategy=FETCH_STRATEGY_PLAYWRIGHT_PROXY)
+        except Exception as e3:
+            log.error(
+                "fetch failed all stages url=%s proxy_attempted=%s final_reason=%s",
                 url,
-                e2,
-                bl_proxy_timeout,
+                True,
+                e3,
             )
-            proxy_attempted = True
-            try:
-                return await fetch_html_playwright_proxy(url, timeout=bl_proxy_timeout)
-            except Exception as e3:
-                log.error(
-                    "fetch failed all stages url=%s proxy_attempted=%s final_reason=%s",
-                    url,
-                    proxy_attempted,
-                    e3,
-                )
-                raise FetchHtmlError(
-                    "all_fetch_stages_blocked",
-                    status_code=403,
-                    api_status_code=424,
-                    final_reason=str(e3),
-                ) from e3
+            raise FetchHtmlError(
+                "all_fetch_stages_blocked",
+                status_code=403,
+                api_status_code=424,
+                final_reason=str(e3),
+            ) from e3
+
+
+def fetch_html_for_saved_strategy_sync(
+    url: str,
+    strategy: str | None,
+    *,
+    timeout_normal: float = 12.0,
+) -> str:
+    """נתיב ישיר לפי אסטרטגיה שמורה לדומיין (ללא fallback עד שמפילים החוצה)."""
+    s = normalize_fetch_strategy(strategy)
+    if s == FETCH_STRATEGY_HTTP:
+        return fetch_html_sync_no_fallback(url, timeout=timeout_normal)
+    t = _fallback_stage_timeout(45.0, proxy=True)
+    return asyncio.run(fetch_html_playwright_proxy(url, timeout=t))
+
+
+async def fetch_html_for_saved_strategy(
+    url: str,
+    strategy: str | None,
+    *,
+    timeout_normal: float = 12.0,
+) -> str:
+    s = normalize_fetch_strategy(strategy)
+    if s == FETCH_STRATEGY_HTTP:
+        return await fetch_html_no_fallback(url, timeout=timeout_normal)
+    t = _fallback_stage_timeout(45.0, proxy=True)
+    return await fetch_html_playwright_proxy(url, timeout=t)
+
+
+def fetch_html_sync_with_fallback(url: str, timeout: float = 45.0) -> str:
+    return fetch_html_sync_with_fallback_meta(url, timeout=timeout).html
+
+
+async def fetch_html_with_fallback(url: str, timeout: float = 45.0) -> str:
+    return (await fetch_html_with_fallback_meta(url, timeout=timeout)).html
 
 
 def fetch_html_sync(url: str, timeout: float = 45.0) -> str:

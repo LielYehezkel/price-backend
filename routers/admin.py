@@ -25,13 +25,19 @@ from backend.models import (
 )
 from backend.services.price_sanity import get_settings
 from backend.services.domain_policy import iter_competitor_ids_for_domain
+from backend.services.domain_queue_repair import repair_all_missing_domain_queue_items_global
 from backend.services.extract import run_extraction_pipeline, validate_selector_with_fallbacks
 from backend.services.fetch_html import (
     FetchHtmlError,
+    FetchedHtml,
     fetch_error_api_status,
     fetch_html_sync,
+    fetch_html_sync_with_fallback_meta,
     format_fetch_error_hebrew,
 )
+from backend.services.monitor_checks import run_competitor_check
+from backend.services.scan_engine_journal import compute_scan_engine_health, get_or_create_heartbeat
+from backend.services.system_config import get_or_create_system_config
 
 
 def _safe_fetch_html_for_admin(url: str) -> str:
@@ -51,10 +57,26 @@ def _safe_fetch_html_for_admin(url: str) -> str:
             status.HTTP_502_BAD_GATEWAY,
             f"שגיאת רשת במשיכת הדף: {e!s}",
         ) from e
-from backend.services.domain_queue_repair import repair_all_missing_domain_queue_items_global
-from backend.services.monitor_checks import run_competitor_check
-from backend.services.scan_engine_journal import compute_scan_engine_health, get_or_create_heartbeat
-from backend.services.system_config import get_or_create_system_config
+
+
+def _safe_fetch_html_meta_for_admin(url: str) -> FetchedHtml:
+    try:
+        return fetch_html_sync_with_fallback_meta(url)
+    except FetchHtmlError as e:
+        raise HTTPException(fetch_error_api_status(e), format_fetch_error_hebrew(e)) from e
+    except httpx.HTTPStatusError as e:
+        code = e.response.status_code if e.response is not None else "?"
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY,
+            f"האתר חסם את השרת (HTTP {code}). נסו שוב, או פתחו את הקישור ממחשב — לעיתים WAF חוסם כתובות דאטה-סנטר.",
+        ) from e
+    except httpx.HTTPError as e:
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY,
+            f"שגיאת רשת במשיכת הדף: {e!s}",
+        ) from e
+
+
 from backend.routers.price import ResolveOut, run_price_resolve
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
@@ -427,7 +449,9 @@ def approve_domain_price_review(
 
     if not sample:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "אין כתובת דוגמה — הוסף קישור מתחרה והרץ סריקה")
-    html = _safe_fetch_html_for_admin(sample)
+    fetched = _safe_fetch_html_meta_for_admin(sample)
+    html = fetched.html
+    strat = fetched.strategy
     alts = body.selector_alternates or []
     price, used = validate_selector_with_fallbacks(html, body.css_selector.strip(), alts)
     if price is None or not used:
@@ -438,6 +462,7 @@ def approve_domain_price_review(
     if row:
         row.css_selector = used
         row.alternates_json = alts_json
+        row.fetch_strategy = strat
         row.updated_at = utcnow()
         session.add(row)
     else:
@@ -446,6 +471,7 @@ def approve_domain_price_review(
                 domain=domain,
                 css_selector=used,
                 alternates_json=alts_json,
+                fetch_strategy=strat,
                 updated_at=utcnow(),
             ),
         )
