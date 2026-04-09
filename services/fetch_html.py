@@ -349,6 +349,12 @@ def _is_blocking_error(e: Exception) -> bool:
     return True
 
 
+def _fallback_stage_timeout(timeout: float, *, proxy: bool) -> float:
+    """Bound fallback time on blocked sites so worker threads are freed quickly."""
+    cap = 10.0 if proxy else 12.0
+    return min(float(timeout), cap)
+
+
 def fetch_html_browserless(url: str, use_proxy: bool = False, timeout: float = 45.0) -> str:
     token = (os.getenv("BROWSERLESS_TOKEN") or "").strip()
     if not token:
@@ -359,7 +365,13 @@ def fetch_html_browserless(url: str, use_proxy: bool = False, timeout: float = 4
         # Browserless expects proxy flags in query params, not JSON body.
         endpoint = f"{endpoint}&proxy=residential"
     stage = "browserless_proxy" if use_proxy else "browserless"
-    log.info("fetch stage=%s url=%s endpoint_has_proxy=%s", stage, url, use_proxy)
+    log.warning(
+        "fetch stage=%s starting endpoint_has_proxy=%s timeout=%ss url=%s",
+        stage,
+        use_proxy,
+        timeout,
+        url,
+    )
     last_err: FetchHtmlError | None = None
     payloads = _browserless_payload_candidates(url)
     try:
@@ -464,13 +476,20 @@ def fetch_html_sync_with_fallback(url: str, timeout: float = 45.0) -> str:
             log.warning("BROWSERLESS_TOKEN missing; skipping browserless fallback url=%s", url)
             if isinstance(e, Exception):
                 raise e
+        bl_timeout = _fallback_stage_timeout(timeout, proxy=False)
         try:
-            return fetch_html_browserless(url, use_proxy=False, timeout=timeout)
+            return fetch_html_browserless(url, use_proxy=False, timeout=bl_timeout)
         except Exception as e2:
-            log.warning("fallback triggered stage=browserless url=%s err=%s", url, e2)
+            bl_proxy_timeout = _fallback_stage_timeout(timeout, proxy=True)
+            log.warning(
+                "fallback triggered stage=browserless url=%s err=%s next_stage=browserless_proxy timeout=%ss",
+                url,
+                e2,
+                bl_proxy_timeout,
+            )
             proxy_attempted = True
             try:
-                return fetch_html_browserless(url, use_proxy=True, timeout=timeout)
+                return fetch_html_browserless(url, use_proxy=True, timeout=bl_proxy_timeout)
             except Exception as e3:
                 log.error(
                     "fetch failed all stages url=%s proxy_attempted=%s final_reason=%s",
@@ -510,13 +529,20 @@ async def fetch_html_with_fallback(url: str, timeout: float = 45.0) -> str:
             log.warning("BROWSERLESS_TOKEN missing; skipping browserless fallback url=%s", url)
             if isinstance(e, Exception):
                 raise e
+        bl_timeout = _fallback_stage_timeout(timeout, proxy=False)
         try:
-            return await asyncio.to_thread(fetch_html_browserless, url, False, timeout)
+            return await asyncio.to_thread(fetch_html_browserless, url, False, bl_timeout)
         except Exception as e2:
-            log.warning("fallback triggered stage=browserless url=%s err=%s", url, e2)
+            bl_proxy_timeout = _fallback_stage_timeout(timeout, proxy=True)
+            log.warning(
+                "fallback triggered stage=browserless url=%s err=%s next_stage=browserless_proxy timeout=%ss",
+                url,
+                e2,
+                bl_proxy_timeout,
+            )
             proxy_attempted = True
             try:
-                return await asyncio.to_thread(fetch_html_browserless, url, True, timeout)
+                return await asyncio.to_thread(fetch_html_browserless, url, True, bl_proxy_timeout)
             except Exception as e3:
                 log.error(
                     "fetch failed all stages url=%s proxy_attempted=%s final_reason=%s",
