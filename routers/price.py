@@ -18,6 +18,7 @@ from backend.services.fetch_html import (
     FetchHtmlError,
     fetch_error_api_status,
     fetch_html,
+    fetch_html_no_fallback,
     format_fetch_error_hebrew,
 )
 from backend.services.resolve_cache import get_cache, put_cache
@@ -51,13 +52,35 @@ async def run_price_resolve(session: Session, url_raw: str, *, ignore_saved_sele
     """לוגיקת resolve — לשימוש מ־/resolve ומפאנל אדמין (עם התעלמות מסלקטור שמור)."""
     url = _validate_url(url_raw.strip())
     domain = normalize_domain(url)
+    learned: str | None = None
+    saved = session.get(DomainPriceSelector, domain)
+    if saved and not ignore_saved_selector:
+        # Fast path: for known domain selector, try cheap fetch first (no heavy fallback chain).
+        try:
+            html_fast = await fetch_html_no_fallback(url, timeout=12.0)
+            price_fast = apply_saved_selector(html_fast, saved.css_selector)
+            if price_fast:
+                learned = saved.css_selector
+                token = put_cache(html_fast, url)
+                return ResolveOut(
+                    url=url,
+                    domain=domain,
+                    price=price_fast,
+                    currency=None,
+                    source="learned_selector",
+                    learned_selector=learned,
+                    candidates=[],
+                    resolution_token=token,
+                )
+        except Exception:
+            # Any fast-path failure falls back to existing full flow below.
+            pass
+
     try:
         html = await fetch_html(url)
     except FetchHtmlError as e:
         raise HTTPException(fetch_error_api_status(e), format_fetch_error_hebrew(e)) from None
 
-    learned: str | None = None
-    saved = session.get(DomainPriceSelector, domain)
     if saved and not ignore_saved_selector:
         price = apply_saved_selector(html, saved.css_selector)
         if price:

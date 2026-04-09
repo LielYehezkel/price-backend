@@ -24,7 +24,7 @@ from backend.services.auto_pricing import maybe_apply_auto_pricing
 from backend.services.domain_policy import domain_from_url, domain_is_live
 from backend.services.scan_engine_journal import append_operational_log_safe, classify_competitor_scan_failure
 from backend.services.extract import apply_saved_selector, run_extraction_pipeline
-from backend.services.fetch_html import FetchHtmlError, fetch_html_sync
+from backend.services.fetch_html import FetchHtmlError, fetch_html_sync, fetch_html_sync_no_fallback
 from backend.services.price_sanity import validate_competitor_price
 from backend.services.woo_sync import effective_wc_price, fetch_wc_product_by_id
 
@@ -156,34 +156,54 @@ def run_competitor_check(session: Session, competitor_id: int) -> CompetitorChec
     prev_comp = comp.last_price
     domain = domain_from_url(comp.url)
     live = domain_is_live(session, domain)
-    try:
-        html = fetch_html_sync(comp.url)
-    except FetchHtmlError as e:
-        code = e.status_code if e.status_code is not None else 0
-        return _finalize_after_fetch_error(
-            session, shop, product, comp, domain, prev_comp, published=live, reason=f"HTTP {code}",
-        )
-    except httpx.HTTPStatusError as e:
-        code = e.response.status_code if e.response is not None else 0
-        return _finalize_after_fetch_error(
-            session, shop, product, comp, domain, prev_comp, published=live, reason=f"HTTP {code}",
-        )
-    except httpx.HTTPError as e:
-        return _finalize_after_fetch_error(
-            session, shop, product, comp, domain, prev_comp, published=live, reason=str(e),
-        )
-    except Exception as e:
-        return _finalize_after_fetch_error(
-            session, shop, product, comp, domain, prev_comp, published=live, reason=str(e),
-        )
+    saved = session.get(DomainPriceSelector, domain) if live else None
+    html_fast: str | None = None
+    fast_price: float | None = None
+
+    # Fast path for known domains: cheap fetch (no heavy fallback) + saved selector match.
+    if saved:
+        try:
+            html_fast = fetch_html_sync_no_fallback(comp.url, timeout=12.0)
+            fast_price = apply_saved_selector(html_fast, saved.css_selector)
+            if fast_price is not None:
+                logger.info("competitor_fast_path_hit link=%s domain=%s", comp.id, domain)
+        except Exception:
+            # Any cheap-path miss/failure falls through to full fetch flow.
+            pass
+
+    html: str
+    if html_fast is not None and fast_price is not None:
+        html = html_fast
+    else:
+        try:
+            html = fetch_html_sync(comp.url)
+        except FetchHtmlError as e:
+            code = e.status_code if e.status_code is not None else 0
+            return _finalize_after_fetch_error(
+                session, shop, product, comp, domain, prev_comp, published=live, reason=f"HTTP {code}",
+            )
+        except httpx.HTTPStatusError as e:
+            code = e.response.status_code if e.response is not None else 0
+            return _finalize_after_fetch_error(
+                session, shop, product, comp, domain, prev_comp, published=live, reason=f"HTTP {code}",
+            )
+        except httpx.HTTPError as e:
+            return _finalize_after_fetch_error(
+                session, shop, product, comp, domain, prev_comp, published=live, reason=str(e),
+            )
+        except Exception as e:
+            return _finalize_after_fetch_error(
+                session, shop, product, comp, domain, prev_comp, published=live, reason=str(e),
+            )
 
     price: float | None = None
     cur: str | None = None
     candidates: list = []
 
     if live:
-        saved = session.get(DomainPriceSelector, domain)
-        if saved:
+        if saved and fast_price is not None:
+            price = fast_price
+        elif saved:
             price = apply_saved_selector(html, saved.css_selector)
         if price is None:
             result = run_extraction_pipeline(html)

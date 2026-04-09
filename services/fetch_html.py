@@ -315,6 +315,16 @@ async def _fetch_html_primary(url: str, timeout: float = 45.0) -> str:
     return await asyncio.to_thread(_fetch_via_httpx, url, timeout)
 
 
+def fetch_html_sync_no_fallback(url: str, timeout: float = 12.0) -> str:
+    """Cheap path: normal fetch only (no browserless/playwright fallback)."""
+    return _fetch_html_primary_sync(url, timeout=timeout)
+
+
+async def fetch_html_no_fallback(url: str, timeout: float = 12.0) -> str:
+    """Cheap async path: normal fetch only (no fallback chain)."""
+    return await _fetch_html_primary(url, timeout=timeout)
+
+
 def _is_blocked_html(html: str | None) -> bool:
     if not html or not html.strip():
         return True
