@@ -528,9 +528,14 @@ def _is_blocking_error(e: Exception) -> bool:
 
 
 def _fallback_stage_timeout(timeout: float, *, proxy: bool) -> float:
-    """Bound fallback time on blocked sites so worker threads are freed quickly."""
-    cap = 10.0 if proxy else 12.0
+    """Bound fallback time on blocked sites; proxy stage needs more headroom for slow CF pages."""
+    cap = 22.0 if proxy else 12.0
     return min(float(timeout), cap)
+
+
+# If goto hits TimeoutError but the document already has substantial HTML, return it anyway
+# (domcontentloaded can be late while the tree is already parseable for selectors).
+_PLAYWRIGHT_TIMEOUT_MIN_HTML_LEN = 25_000
 
 
 def _playwright_proxy_settings_from_env() -> dict[str, str] | None:
@@ -643,17 +648,18 @@ async def fetch_html_playwright_proxy(url: str, timeout: float = 10.0) -> str:
             log.warning("playwright_proxy page_opened url=%s", url)
             await page.route("**/*", _build_playwright_proxy_route_interceptor(url))
             log.warning("playwright_proxy route_interceptor_enabled url=%s", url)
-            nav_timeout_ms = max(int(timeout * 1000), 8_000)
+            nav_timeout_ms = max(int(timeout * 1000), 20_000)
             log.warning(
                 "playwright_proxy goto_start url=%s wait_until=%s timeout_ms=%s",
                 url,
                 "domcontentloaded",
                 nav_timeout_ms,
             )
+            resp = None
             try:
                 resp = await page.goto(url, wait_until="domcontentloaded", timeout=nav_timeout_ms)
             except PlaywrightTimeoutError as ex:
-                # Timeout is common on challenged sites; log page snapshot before failing.
+                # Often the DOM is already large enough while Playwright waits on domcontentloaded.
                 html_timeout = await page.content()
                 timeout_preview = _safe_html_preview(html_timeout, 300)
                 timeout_block_type = _detect_playwright_block(html_timeout)
@@ -667,6 +673,36 @@ async def fetch_html_playwright_proxy(url: str, timeout: float = 10.0) -> str:
                     timeout_block_type or "-",
                     timeout_preview,
                 )
+                if len(html_timeout or "") >= _PLAYWRIGHT_TIMEOUT_MIN_HTML_LEN:
+                    log.warning(
+                        "playwright_proxy goto_timeout_recoverable url=%s html_len=%s (returning partial DOM)",
+                        url,
+                        len(html_timeout),
+                    )
+                    html = html_timeout
+                    preview = timeout_preview
+                    markers = _blocked_markers_found(html)
+                    block_type = timeout_block_type
+                    blocked = bool(block_type)
+                    page_class = timeout_page_class
+                    log.warning(
+                        "proxy_response stage=%s status=%s html_len=%s page_class=%s blocked=%s block_type=%s markers=%s preview=%s",
+                        stage,
+                        None,
+                        len(html or ""),
+                        page_class,
+                        blocked,
+                        block_type or "-",
+                        ",".join(markers) if markers else "-",
+                        preview,
+                    )
+                    if blocked:
+                        log.warning(
+                            "playwright_proxy soft_block_after_timeout_returning_html url=%s block_type=%s",
+                            url,
+                            block_type or "-",
+                        )
+                    return html
                 raise FetchHtmlError(
                     f"Playwright proxy navigation timeout after {nav_timeout_ms}ms",
                     status_code=408,
