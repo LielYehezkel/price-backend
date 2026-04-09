@@ -331,12 +331,16 @@ def _classify_browserless_page(html: str | None) -> str:
     return "unknown_html"
 
 
-def _browserless_payload_candidates(url: str) -> list[dict[str, object]]:
-    return [
-        {"url": url},
-        {"url": url, "gotoOptions": {"waitUntil": "domcontentloaded"}},
-        {"url": url, "gotoOptions": {"waitUntil": "networkidle2"}},
+def _browserless_payload_candidates(url: str, *, proxy_mode: bool) -> list[dict[str, object]]:
+    # Keep payloads conservative and fast on blocked-site path.
+    base: list[dict[str, object]] = [
+        {"url": url, "bestAttempt": True},
+        {"url": url, "bestAttempt": True, "gotoOptions": {"waitUntil": "domcontentloaded"}},
     ]
+    # networkidle2 is slower; use it only on non-proxy stage as a last try.
+    if not proxy_mode:
+        base.append({"url": url, "bestAttempt": True, "gotoOptions": {"waitUntil": "networkidle2"}})
+    return base
 
 
 def _is_blocking_error(e: Exception) -> bool:
@@ -373,9 +377,10 @@ def fetch_html_browserless(url: str, use_proxy: bool = False, timeout: float = 4
         url,
     )
     last_err: FetchHtmlError | None = None
-    payloads = _browserless_payload_candidates(url)
+    payloads = _browserless_payload_candidates(url, proxy_mode=use_proxy)
     try:
-        with httpx.Client(timeout=timeout, follow_redirects=True, trust_env=True) as client:
+        req_timeout = httpx.Timeout(connect=min(6.0, timeout), read=timeout, write=min(8.0, timeout), pool=5.0)
+        with httpx.Client(timeout=req_timeout, follow_redirects=True, trust_env=True) as client:
             for i, payload in enumerate(payloads, start=1):
                 log.info(
                     "browserless request stage=%s attempt=%s proxy_requested=%s proxy_mode=%s url=%s",
@@ -385,7 +390,19 @@ def fetch_html_browserless(url: str, use_proxy: bool = False, timeout: float = 4
                     "residential(query)" if use_proxy else "none",
                     url,
                 )
-                r = client.post(endpoint, json=payload)
+                try:
+                    r = client.post(endpoint, json=payload)
+                except httpx.ReadTimeout as ex:
+                    log.warning(
+                        "fetch stage=%s attempt=%s read_timeout=%ss proxy_mode=%s url=%s",
+                        stage,
+                        i,
+                        timeout,
+                        "residential(query)" if use_proxy else "none",
+                        url,
+                    )
+                    last_err = FetchHtmlError(str(ex) or "Browserless read timeout", status_code=408)
+                    continue
                 log.info("fetch stage=%s attempt=%s status=%s url=%s", stage, i, r.status_code, url)
                 if r.status_code == 400:
                     body_sample = (r.text or "")[:220].replace("\n", " ").strip()
