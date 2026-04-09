@@ -393,10 +393,12 @@ _PLAYWRIGHT_CF_INDICATORS = [
 _PLAYWRIGHT_CAPTCHA_INDICATORS = [
     "g-recaptcha",
     "h-captcha",
-    "captcha",
+    "cf-turnstile",
     "are you a robot",
     "prove you're human",
     "i'm not a robot",
+    "verify you are human",
+    "challenge-platform",
 ]
 _PLAYWRIGHT_GEO_INDICATORS = [
     "not available in your region",
@@ -413,6 +415,7 @@ def _detect_playwright_block(html: str | None) -> str | None:
     low = html.lower()
     if any(ind in low for ind in _PLAYWRIGHT_CF_INDICATORS):
         return "cloudflare"
+    # Captcha is treated as block only for explicit challenge markers.
     if any(ind in low for ind in _PLAYWRIGHT_CAPTCHA_INDICATORS):
         return "captcha"
     if any(ind in low for ind in _PLAYWRIGHT_GEO_INDICATORS):
@@ -627,8 +630,15 @@ async def fetch_html_playwright_proxy(url: str, timeout: float = 10.0) -> str:
             await browser.close()
             if status in (403, 429, 503):
                 raise FetchHtmlError(f"Playwright proxy HTTP {status}", status_code=status)
-            if blocked:
+            # Soft-block signals on HTTP 200 are not fatal: return HTML and let extraction decide.
+            if blocked and status != 200:
                 raise FetchHtmlError("Playwright proxy blocked/empty html", status_code=403)
+            if blocked and status == 200:
+                log.warning(
+                    "playwright_proxy soft_block_signal_on_200 returning_html url=%s block_type=%s",
+                    url,
+                    block_type or "-",
+                )
             return html
     except FetchHtmlError:
         raise
