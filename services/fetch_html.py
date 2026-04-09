@@ -439,6 +439,7 @@ async def fetch_html_playwright_proxy(url: str, timeout: float = 10.0) -> str:
     try:
         from playwright.async_api import async_playwright
     except Exception as ex:
+        log.error("playwright_proxy import_failed url=%s err=%s", url, ex)
         raise FetchHtmlError(
             "Playwright is not available; install playwright and browser binaries",
             final_reason=str(ex),
@@ -447,6 +448,7 @@ async def fetch_html_playwright_proxy(url: str, timeout: float = 10.0) -> str:
     html = ""
     try:
         async with async_playwright() as p:
+            log.warning("playwright_proxy launching_chromium url=%s", url)
             browser = await p.chromium.launch(
                 headless=True,
                 proxy=proxy_settings,
@@ -461,6 +463,7 @@ async def fetch_html_playwright_proxy(url: str, timeout: float = 10.0) -> str:
                     "--no-first-run",
                 ],
             )
+            log.warning("playwright_proxy browser_launched url=%s", url)
             context = await browser.new_context(
                 viewport={"width": 1440, "height": 900},
                 user_agent=CHROME_WINDOWS_UA,
@@ -468,6 +471,7 @@ async def fetch_html_playwright_proxy(url: str, timeout: float = 10.0) -> str:
                 timezone_id="Asia/Jerusalem",
                 java_script_enabled=True,
             )
+            log.warning("playwright_proxy context_ready url=%s", url)
             await context.add_init_script(
                 """
                 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
@@ -476,7 +480,9 @@ async def fetch_html_playwright_proxy(url: str, timeout: float = 10.0) -> str:
                 """,
             )
             page = await context.new_page()
+            log.warning("playwright_proxy page_opened url=%s", url)
             await page.route("**/*", _playwright_proxy_route_interceptor)
+            log.warning("playwright_proxy route_interceptor_enabled url=%s", url)
             resp = await page.goto(url, wait_until="domcontentloaded", timeout=int(timeout * 1000))
             status = resp.status if resp else None
             html = await page.content()
@@ -505,6 +511,7 @@ async def fetch_html_playwright_proxy(url: str, timeout: float = 10.0) -> str:
     except FetchHtmlError:
         raise
     except Exception as ex:
+        log.error("playwright_proxy failed url=%s err=%s", url, ex, exc_info=True)
         raise FetchHtmlError(str(ex) or "playwright proxy error", status_code=408) from ex
 
 
