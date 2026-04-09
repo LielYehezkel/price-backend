@@ -404,6 +404,14 @@ def fetch_html_browserless(url: str, use_proxy: bool = False, timeout: float = 4
                     last_err = FetchHtmlError(str(ex) or "Browserless read timeout", status_code=408)
                     continue
                 log.info("fetch stage=%s attempt=%s status=%s url=%s", stage, i, r.status_code, url)
+                if use_proxy:
+                    log.warning(
+                        "proxy_response stage=%s attempt=%s status=%s url=%s",
+                        stage,
+                        i,
+                        r.status_code,
+                        url,
+                    )
                 if r.status_code == 400:
                     body_sample = (r.text or "")[:220].replace("\n", " ").strip()
                     log.warning(
@@ -452,6 +460,17 @@ def fetch_html_browserless(url: str, use_proxy: bool = False, timeout: float = 4
                     i,
                     preview,
                 )
+                if use_proxy:
+                    log.warning(
+                        "proxy_response stage=%s attempt=%s html_len=%s page_class=%s blocked=%s markers=%s preview=%s",
+                        stage,
+                        i,
+                        len(html),
+                        classification,
+                        blocked,
+                        ",".join(markers) if markers else "-",
+                        preview,
+                    )
                 if blocked:
                     last_err = FetchHtmlError(
                         "Browserless blocked/empty html",
