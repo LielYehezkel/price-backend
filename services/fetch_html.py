@@ -83,6 +83,15 @@ _BLOCK_MARKERS_WEAK = (
     "request blocked",
 )
 
+_BLOCK_MARKERS_BROWSERLESS = (
+    "access denied",
+    "verify you are human",
+    "cf-challenge",
+    "captcha",
+    "attention required",
+    "cloudflare ray id",
+)
+
 
 def _origin_root(url: str) -> str:
     from urllib.parse import urlparse
@@ -284,6 +293,30 @@ def _blocked_markers_found(html: str | None) -> list[str]:
     return hit
 
 
+def _is_blocked_browserless_html(html: str | None) -> bool:
+    """סיווג חסימה לנתיב browserless בלבד — לא להחמיר מדי כדי למנוע false positives."""
+    if not html or not html.strip():
+        return True
+    low = html.lower()
+    return any(m in low for m in _BLOCK_MARKERS_BROWSERLESS)
+
+
+def _browserless_payload_candidates(url: str, *, use_proxy: bool) -> list[dict[str, object]]:
+    base: list[dict[str, object]] = [
+        {"url": url},
+        {"url": url, "gotoOptions": {"waitUntil": "domcontentloaded"}},
+        {"url": url, "gotoOptions": {"waitUntil": "networkidle2"}},
+    ]
+    if not use_proxy:
+        return base
+    # ספקים שונים מצפים לפורמט שונה של proxy
+    out: list[dict[str, object]] = []
+    for p in base:
+        out.append({**p, "proxy": "residential"})
+        out.append({**p, "proxy": {"type": "residential"}})
+    return out
+
+
 def _is_blocking_error(e: Exception) -> bool:
     if isinstance(e, FetchHtmlError):
         if e.status_code in (403, 429):
@@ -300,44 +333,54 @@ def fetch_html_browserless(url: str, use_proxy: bool = False, timeout: float = 4
         raise FetchHtmlError("Browserless token missing")
 
     endpoint = f"https://production-sfo.browserless.io/content?token={token}"
-    payload: dict[str, object] = {
-        "url": url,
-        "gotoOptions": {"waitUntil": "networkidle2", "timeout": int(timeout * 1000)},
-        "waitForTimeout": 1200,
-    }
-    if use_proxy:
-        payload["proxy"] = "residential"
-
     stage = "browserless_proxy" if use_proxy else "browserless"
     log.info("fetch stage=%s url=%s", stage, url)
+    last_err: FetchHtmlError | None = None
+    payloads = _browserless_payload_candidates(url, use_proxy=use_proxy)
     try:
         with httpx.Client(timeout=timeout, follow_redirects=True, trust_env=True) as client:
-            r = client.post(endpoint, json=payload)
-            log.info("fetch stage=%s status=%s url=%s", stage, r.status_code, url)
-            if r.status_code >= 400:
-                raise FetchHtmlError(f"Browserless HTTP {r.status_code}", status_code=r.status_code)
-            html = r.text or ""
-            markers = _blocked_markers_found(html)
-            blocked = _is_blocked_html(html)
-            log.info(
-                "fetch stage=%s html_len=%s blocked=%s markers=%s url=%s",
-                stage,
-                len(html),
-                blocked,
-                ",".join(markers) if markers else "-",
-                url,
-            )
-            if blocked:
-                raise FetchHtmlError(
-                    "Browserless blocked/empty html",
-                    status_code=403,
-                    final_reason=f"stage={stage};len={len(html)};markers={markers}",
+            for i, payload in enumerate(payloads, start=1):
+                r = client.post(endpoint, json=payload)
+                log.info("fetch stage=%s attempt=%s status=%s url=%s", stage, i, r.status_code, url)
+                if r.status_code == 400:
+                    body_sample = (r.text or "")[:220].replace("\n", " ").strip()
+                    log.warning(
+                        "fetch stage=%s attempt=%s bad_request body=%s",
+                        stage,
+                        i,
+                        body_sample,
+                    )
+                    last_err = FetchHtmlError("Browserless HTTP 400", status_code=400, final_reason=body_sample)
+                    continue
+                if r.status_code >= 400:
+                    raise FetchHtmlError(f"Browserless HTTP {r.status_code}", status_code=r.status_code)
+                html = r.text or ""
+                markers = _blocked_markers_found(html)
+                blocked = _is_blocked_browserless_html(html)
+                log.info(
+                    "fetch stage=%s attempt=%s html_len=%s blocked=%s markers=%s url=%s",
+                    stage,
+                    i,
+                    len(html),
+                    blocked,
+                    ",".join(markers) if markers else "-",
+                    url,
                 )
-            return html
+                if blocked:
+                    last_err = FetchHtmlError(
+                        "Browserless blocked/empty html",
+                        status_code=403,
+                        final_reason=f"stage={stage};len={len(html)};markers={markers}",
+                    )
+                    continue
+                return html
     except FetchHtmlError:
         raise
     except httpx.RequestError as e:
         raise FetchHtmlError(str(e) or "browserless network error") from e
+    if last_err is not None:
+        raise last_err
+    raise FetchHtmlError("Browserless failed with unknown reason", status_code=500)
 
 
 def fetch_html_sync_with_fallback(url: str, timeout: float = 45.0) -> str:
@@ -355,8 +398,6 @@ def fetch_html_sync_with_fallback(url: str, timeout: float = 45.0) -> str:
             ",".join(markers) if markers else "-",
             url,
         )
-        if blocked:
-            raise FetchHtmlError("Blocked html on normal fetch", status_code=403)
         return html
     except Exception as e:
         if not _is_blocking_error(e):
@@ -403,8 +444,6 @@ async def fetch_html_with_fallback(url: str, timeout: float = 45.0) -> str:
             ",".join(markers) if markers else "-",
             url,
         )
-        if blocked:
-            raise FetchHtmlError("Blocked html on normal fetch", status_code=403)
         return html
     except Exception as e:
         if not _is_blocking_error(e):
