@@ -67,6 +67,11 @@ CHROME_WINDOWS_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/131.0.0.0 Safari/537.36"
 )
+CHROME_WINDOWS_UA_124 = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
 
 _BLOCK_MARKERS_STRONG = (
     "access denied",
@@ -105,7 +110,9 @@ _PLAYWRIGHT_PROXY_BLOCKED_DOMAINS = frozenset(
     {
         "google-analytics.com",
         "googletagmanager.com",
+        "googletagservices.com",
         "doubleclick.net",
+        "google.com/ads",
         "connect.facebook.net",
         "facebook.com/tr",
         "hotjar.com",
@@ -113,10 +120,20 @@ _PLAYWRIGHT_PROXY_BLOCKED_DOMAINS = frozenset(
         "segment.com",
         "mixpanel.com",
         "amplitude.com",
+        "optimizely.com",
+        "vwo.com",
+        "convertexperiments.com",
         "intercom.io",
         "drift.com",
         "tawk.to",
+        "livechatinc.com",
         "zendesk.com",
+        "ads.twitter.com",
+        "snap.licdn.com",
+        "static.ads-twitter.com",
+        "bat.bing.com",
+        "cdn.segment.com",
+        "cdn.heapanalytics.com",
     },
 )
 
@@ -363,6 +380,46 @@ def _classify_browserless_page(html: str | None) -> str:
     return "unknown_html"
 
 
+_PLAYWRIGHT_CF_INDICATORS = [
+    "cf-browser-verification",
+    "cf_chl_opt",
+    "__cf_chl_f_tk",
+    "ray id",
+    "error 1009",
+    "access denied",
+    "cloudflare to restrict access",
+    "checking if the site connection is secure",
+]
+_PLAYWRIGHT_CAPTCHA_INDICATORS = [
+    "g-recaptcha",
+    "h-captcha",
+    "captcha",
+    "are you a robot",
+    "prove you're human",
+    "i'm not a robot",
+]
+_PLAYWRIGHT_GEO_INDICATORS = [
+    "not available in your region",
+    "not available in your country",
+    "geo-restricted",
+    "geographically restricted",
+    "country is not supported",
+]
+
+
+def _detect_playwright_block(html: str | None) -> str | None:
+    if not html:
+        return "empty"
+    low = html.lower()
+    if any(ind in low for ind in _PLAYWRIGHT_CF_INDICATORS):
+        return "cloudflare"
+    if any(ind in low for ind in _PLAYWRIGHT_CAPTCHA_INDICATORS):
+        return "captcha"
+    if any(ind in low for ind in _PLAYWRIGHT_GEO_INDICATORS):
+        return "geo"
+    return None
+
+
 def _is_blocked_url_for_playwright_proxy(url: str) -> bool:
     low = (url or "").lower()
     return any(d in low for d in _PLAYWRIGHT_PROXY_BLOCKED_DOMAINS)
@@ -487,13 +544,16 @@ async def fetch_html_playwright_proxy(url: str, timeout: float = 10.0) -> str:
                     "--disable-extensions",
                     "--disable-background-networking",
                     "--disable-sync",
+                    "--disable-translate",
+                    "--disable-default-apps",
+                    "--mute-audio",
                     "--no-first-run",
                 ],
             )
             log.warning("playwright_proxy browser_launched url=%s", url)
             context = await browser.new_context(
                 viewport={"width": 1440, "height": 900},
-                user_agent=CHROME_WINDOWS_UA,
+                user_agent=CHROME_WINDOWS_UA_124,
                 locale="he-IL",
                 timezone_id="Asia/Jerusalem",
                 java_script_enabled=True,
@@ -510,27 +570,30 @@ async def fetch_html_playwright_proxy(url: str, timeout: float = 10.0) -> str:
             log.warning("playwright_proxy page_opened url=%s", url)
             await page.route("**/*", _playwright_proxy_route_interceptor)
             log.warning("playwright_proxy route_interceptor_enabled url=%s", url)
-            resp = await page.goto(url, wait_until="domcontentloaded", timeout=int(timeout * 1000))
+            nav_timeout_ms = max(int(timeout * 1000), 20_000)
+            resp = await page.goto(url, wait_until="domcontentloaded", timeout=nav_timeout_ms)
             status = resp.status if resp else None
             html = await page.content()
             preview = _safe_html_preview(html, 300)
             markers = _blocked_markers_found(html)
-            blocked = _is_blocked_browserless_html(html)
+            block_type = _detect_playwright_block(html)
+            blocked = bool(block_type)
             page_class = _classify_browserless_page(html)
             log.warning(
-                "proxy_response stage=%s status=%s html_len=%s page_class=%s blocked=%s markers=%s preview=%s",
+                "proxy_response stage=%s status=%s html_len=%s page_class=%s blocked=%s block_type=%s markers=%s preview=%s",
                 stage,
                 status,
                 len(html or ""),
                 page_class,
                 blocked,
+                block_type or "-",
                 ",".join(markers) if markers else "-",
                 preview,
             )
             await page.close()
             await context.close()
             await browser.close()
-            if status in (403, 429):
+            if status in (403, 429, 503):
                 raise FetchHtmlError(f"Playwright proxy HTTP {status}", status_code=status)
             if blocked:
                 raise FetchHtmlError("Playwright proxy blocked/empty html", status_code=403)
