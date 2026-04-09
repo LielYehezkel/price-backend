@@ -331,20 +331,12 @@ def _classify_browserless_page(html: str | None) -> str:
     return "unknown_html"
 
 
-def _browserless_payload_candidates(url: str, *, use_proxy: bool) -> list[dict[str, object]]:
-    base: list[dict[str, object]] = [
+def _browserless_payload_candidates(url: str) -> list[dict[str, object]]:
+    return [
         {"url": url},
         {"url": url, "gotoOptions": {"waitUntil": "domcontentloaded"}},
         {"url": url, "gotoOptions": {"waitUntil": "networkidle2"}},
     ]
-    if not use_proxy:
-        return base
-    # ספקים שונים מצפים לפורמט שונה של proxy
-    out: list[dict[str, object]] = []
-    for p in base:
-        out.append({**p, "proxy": "residential"})
-        out.append({**p, "proxy": {"type": "residential"}})
-    return out
 
 
 def _is_blocking_error(e: Exception) -> bool:
@@ -363,20 +355,22 @@ def fetch_html_browserless(url: str, use_proxy: bool = False, timeout: float = 4
         raise FetchHtmlError("Browserless token missing")
 
     endpoint = f"https://production-sfo.browserless.io/content?token={token}"
+    if use_proxy:
+        # Browserless expects proxy flags in query params, not JSON body.
+        endpoint = f"{endpoint}&proxy=residential"
     stage = "browserless_proxy" if use_proxy else "browserless"
-    log.info("fetch stage=%s url=%s", stage, url)
+    log.info("fetch stage=%s url=%s endpoint_has_proxy=%s", stage, url, use_proxy)
     last_err: FetchHtmlError | None = None
-    payloads = _browserless_payload_candidates(url, use_proxy=use_proxy)
+    payloads = _browserless_payload_candidates(url)
     try:
         with httpx.Client(timeout=timeout, follow_redirects=True, trust_env=True) as client:
             for i, payload in enumerate(payloads, start=1):
-                proxy_mode = payload.get("proxy")
                 log.info(
                     "browserless request stage=%s attempt=%s proxy_requested=%s proxy_mode=%s url=%s",
                     stage,
                     i,
                     use_proxy,
-                    proxy_mode if proxy_mode is not None else "none",
+                    "residential(query)" if use_proxy else "none",
                     url,
                 )
                 r = client.post(endpoint, json=payload)
@@ -389,8 +383,22 @@ def fetch_html_browserless(url: str, use_proxy: bool = False, timeout: float = 4
                         i,
                         body_sample,
                     )
+                    # Do not retry repeated invalid schema requests.
+                    if "validation failed" in body_sample.lower() or "not allowed" in body_sample.lower():
+                        raise FetchHtmlError(
+                            "Browserless request validation failed",
+                            status_code=400,
+                            final_reason=body_sample,
+                        )
                     last_err = FetchHtmlError("Browserless HTTP 400", status_code=400, final_reason=body_sample)
                     continue
+                if r.status_code == 401 and use_proxy:
+                    body_sample = (r.text or "")[:220].replace("\n", " ").strip()
+                    raise FetchHtmlError(
+                        "Browserless proxy may be unsupported by current plan",
+                        status_code=401,
+                        final_reason=body_sample,
+                    )
                 if r.status_code >= 400:
                     raise FetchHtmlError(f"Browserless HTTP {r.status_code}", status_code=r.status_code)
                 html = r.text or ""
@@ -406,7 +414,7 @@ def fetch_html_browserless(url: str, use_proxy: bool = False, timeout: float = 4
                     blocked,
                     classification,
                     ",".join(markers) if markers else "-",
-                    proxy_mode if proxy_mode is not None else "none",
+                    "residential(query)" if use_proxy else "none",
                     url,
                 )
                 log.info(
