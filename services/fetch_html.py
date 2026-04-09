@@ -519,6 +519,7 @@ async def fetch_html_playwright_proxy(url: str, timeout: float = 10.0) -> str:
         url,
     )
     try:
+        from playwright.async_api import TimeoutError as PlaywrightTimeoutError
         from playwright.async_api import async_playwright
     except Exception as ex:
         log.error("playwright_proxy import_failed url=%s err=%s", url, ex)
@@ -570,8 +571,39 @@ async def fetch_html_playwright_proxy(url: str, timeout: float = 10.0) -> str:
             log.warning("playwright_proxy page_opened url=%s", url)
             await page.route("**/*", _playwright_proxy_route_interceptor)
             log.warning("playwright_proxy route_interceptor_enabled url=%s", url)
-            nav_timeout_ms = max(int(timeout * 1000), 20_000)
-            resp = await page.goto(url, wait_until="domcontentloaded", timeout=nav_timeout_ms)
+            nav_timeout_ms = max(int(timeout * 1000), 8_000)
+            log.warning(
+                "playwright_proxy goto_start url=%s wait_until=%s timeout_ms=%s",
+                url,
+                "domcontentloaded",
+                nav_timeout_ms,
+            )
+            try:
+                resp = await page.goto(url, wait_until="domcontentloaded", timeout=nav_timeout_ms)
+            except PlaywrightTimeoutError as ex:
+                # Timeout is common on challenged sites; log page snapshot before failing.
+                html_timeout = await page.content()
+                timeout_preview = _safe_html_preview(html_timeout, 300)
+                timeout_block_type = _detect_playwright_block(html_timeout)
+                timeout_page_class = _classify_browserless_page(html_timeout)
+                log.warning(
+                    "proxy_response stage=%s goto_timeout url=%s html_len=%s page_class=%s block_type=%s preview=%s",
+                    stage,
+                    url,
+                    len(html_timeout or ""),
+                    timeout_page_class,
+                    timeout_block_type or "-",
+                    timeout_preview,
+                )
+                raise FetchHtmlError(
+                    f"Playwright proxy navigation timeout after {nav_timeout_ms}ms",
+                    status_code=408,
+                ) from ex
+            log.warning(
+                "playwright_proxy goto_done url=%s status=%s",
+                url,
+                resp.status if resp else None,
+            )
             status = resp.status if resp else None
             html = await page.content()
             preview = _safe_html_preview(html, 300)
