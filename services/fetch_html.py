@@ -120,6 +120,10 @@ _PLAYWRIGHT_PROXY_BLOCKED_DOMAINS = frozenset(
     },
 )
 
+# Process-level circuit breaker: when Playwright browser binary is missing,
+# avoid retrying expensive launch attempts on every blocked URL.
+_PLAYWRIGHT_PROXY_DISABLED_REASON: str | None = None
+
 
 def _origin_root(url: str) -> str:
     from urllib.parse import urlparse
@@ -419,11 +423,32 @@ def _playwright_proxy_settings_from_env() -> dict[str, str] | None:
     return out
 
 
+def _is_playwright_binary_missing_error(msg: str) -> bool:
+    low = (msg or "").lower()
+    return "executable doesn't exist" in low or "playwright install" in low
+
+
+def _playwright_proxy_is_disabled() -> bool:
+    return _PLAYWRIGHT_PROXY_DISABLED_REASON is not None
+
+
 async def fetch_html_playwright_proxy(url: str, timeout: float = 10.0) -> str:
     """
     Proxy fallback using Playwright + external proxy provider.
     This replaces the previous Browserless built-in proxy stage.
     """
+    global _PLAYWRIGHT_PROXY_DISABLED_REASON
+    if _playwright_proxy_is_disabled():
+        log.warning(
+            "playwright_proxy skipped disabled_reason=%s url=%s",
+            _PLAYWRIGHT_PROXY_DISABLED_REASON,
+            url,
+        )
+        raise FetchHtmlError(
+            "Playwright proxy disabled on this instance",
+            final_reason=_PLAYWRIGHT_PROXY_DISABLED_REASON,
+        )
+
     proxy_settings = _playwright_proxy_settings_from_env()
     if not proxy_settings:
         raise FetchHtmlError("PROXY_SERVER missing for playwright proxy fallback")
@@ -440,6 +465,8 @@ async def fetch_html_playwright_proxy(url: str, timeout: float = 10.0) -> str:
         from playwright.async_api import async_playwright
     except Exception as ex:
         log.error("playwright_proxy import_failed url=%s err=%s", url, ex)
+        if _is_playwright_binary_missing_error(str(ex)):
+            _PLAYWRIGHT_PROXY_DISABLED_REASON = str(ex)
         raise FetchHtmlError(
             "Playwright is not available; install playwright and browser binaries",
             final_reason=str(ex),
@@ -512,6 +539,9 @@ async def fetch_html_playwright_proxy(url: str, timeout: float = 10.0) -> str:
         raise
     except Exception as ex:
         log.error("playwright_proxy failed url=%s err=%s", url, ex, exc_info=True)
+        if _is_playwright_binary_missing_error(str(ex)):
+            _PLAYWRIGHT_PROXY_DISABLED_REASON = str(ex)
+            log.error("playwright_proxy disabled for process reason=%s", _PLAYWRIGHT_PROXY_DISABLED_REASON)
         raise FetchHtmlError(str(ex) or "playwright proxy error", status_code=408) from ex
 
 
