@@ -301,6 +301,36 @@ def _is_blocked_browserless_html(html: str | None) -> bool:
     return any(m in low for m in _BLOCK_MARKERS_BROWSERLESS)
 
 
+def _safe_html_preview(html: str | None, limit: int = 300) -> str:
+    if not html:
+        return ""
+    compact = " ".join(str(html).split())
+    return compact[:limit]
+
+
+def _classify_browserless_page(html: str | None) -> str:
+    if not html or not html.strip():
+        return "empty_page"
+    low = html.lower()
+    if any(x in low for x in ("access denied", "forbidden", "not authorized")):
+        return "access_denied_page"
+    if any(
+        x in low
+        for x in (
+            "cf-challenge",
+            "verify you are human",
+            "cloudflare",
+            "captcha",
+            "attention required",
+            "security check",
+        )
+    ):
+        return "challenge_page"
+    if any(x in low for x in ("<html", "<body", "woocommerce", "product", "price", "add to cart")):
+        return "normal_product_html"
+    return "unknown_html"
+
+
 def _browserless_payload_candidates(url: str, *, use_proxy: bool) -> list[dict[str, object]]:
     base: list[dict[str, object]] = [
         {"url": url},
@@ -340,6 +370,15 @@ def fetch_html_browserless(url: str, use_proxy: bool = False, timeout: float = 4
     try:
         with httpx.Client(timeout=timeout, follow_redirects=True, trust_env=True) as client:
             for i, payload in enumerate(payloads, start=1):
+                proxy_mode = payload.get("proxy")
+                log.info(
+                    "browserless request stage=%s attempt=%s proxy_requested=%s proxy_mode=%s url=%s",
+                    stage,
+                    i,
+                    use_proxy,
+                    proxy_mode if proxy_mode is not None else "none",
+                    url,
+                )
                 r = client.post(endpoint, json=payload)
                 log.info("fetch stage=%s attempt=%s status=%s url=%s", stage, i, r.status_code, url)
                 if r.status_code == 400:
@@ -357,14 +396,24 @@ def fetch_html_browserless(url: str, use_proxy: bool = False, timeout: float = 4
                 html = r.text or ""
                 markers = _blocked_markers_found(html)
                 blocked = _is_blocked_browserless_html(html)
+                classification = _classify_browserless_page(html)
+                preview = _safe_html_preview(html, 300)
                 log.info(
-                    "fetch stage=%s attempt=%s html_len=%s blocked=%s markers=%s url=%s",
+                    "fetch stage=%s attempt=%s html_len=%s blocked=%s page_class=%s markers=%s proxy_mode=%s url=%s",
                     stage,
                     i,
                     len(html),
                     blocked,
+                    classification,
                     ",".join(markers) if markers else "-",
+                    proxy_mode if proxy_mode is not None else "none",
                     url,
+                )
+                log.info(
+                    "fetch stage=%s attempt=%s html_preview=%s",
+                    stage,
+                    i,
+                    preview,
                 )
                 if blocked:
                     last_err = FetchHtmlError(
