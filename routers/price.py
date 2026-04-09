@@ -105,7 +105,12 @@ async def run_price_resolve(session: Session, url_raw: str, *, ignore_saved_sele
     if saved and not ignore_saved_selector:
         strat = normalize_fetch_strategy(getattr(saved, "fetch_strategy", None))
         try:
-            html_fast = await fetch_html_for_saved_strategy(url, strat, timeout_normal=12.0)
+            html_fast = await fetch_html_for_saved_strategy(
+                url,
+                strat,
+                timeout_normal=12.0,
+                early_stop_css_selector=saved.css_selector,
+            )
             price_fast = apply_saved_selector(html_fast, saved.css_selector)
             if price_fast:
                 learned = saved.css_selector
@@ -136,7 +141,12 @@ async def run_price_resolve(session: Session, url_raw: str, *, ignore_saved_sele
             pass
 
     try:
-        fetched = await fetch_html_with_fallback_meta(url)
+        fetched = await fetch_html_with_fallback_meta(
+            url,
+            playwright_early_stop_css_selector=(
+                saved.css_selector if saved and not ignore_saved_selector else None
+            ),
+        )
         html = fetched.html
         strat_used = fetched.strategy
     except FetchHtmlError as e:
@@ -242,7 +252,10 @@ async def confirm_selector(
         html = cached.html
     else:
         try:
-            fetched = await fetch_html_with_fallback_meta(url)
+            fetched = await fetch_html_with_fallback_meta(
+                url,
+                playwright_early_stop_css_selector=(body.css_selector or "").strip() or None,
+            )
             html = fetched.html
             strat_save = fetched.strategy
         except FetchHtmlError as e:

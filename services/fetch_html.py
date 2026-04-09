@@ -156,6 +156,14 @@ _PLAYWRIGHT_PROXY_BLOCKED_DOMAINS = frozenset(
         "bat.bing.com",
         "cdn.segment.com",
         "cdn.heapanalytics.com",
+        "scorecardresearch.com",
+        "taboola.com",
+        "outbrain.com",
+        "moatads.com",
+        "amazon-adsystem.com",
+        "adsystem.amazon.com",
+        "criteo.com",
+        "criteo.net",
     },
 )
 
@@ -491,7 +499,12 @@ _HEAVY_ASSET_RE = re.compile(
 )
 
 
-def _build_playwright_proxy_route_interceptor(target_url: str):
+def _build_playwright_proxy_route_interceptor(
+    target_url: str,
+    *,
+    stats: dict | None = None,
+    block_stylesheets: bool = False,
+):
     from urllib.parse import urlparse
 
     target_root = _root_host(urlparse(target_url).hostname)
@@ -502,19 +515,31 @@ def _build_playwright_proxy_route_interceptor(target_url: str):
         req_low = req_url.lower()
         req_host = urlparse(req_url).hostname
 
+        def _bump() -> None:
+            if stats is not None:
+                stats["blocked"] = int(stats.get("blocked", 0)) + 1
+
+        if block_stylesheets and req.resource_type == "stylesheet":
+            _bump()
+            await route.abort()
+            return
         if req.resource_type in _PLAYWRIGHT_PROXY_BLOCKED_RESOURCE_TYPES:
+            _bump()
             await route.abort()
             return
         if _HEAVY_ASSET_RE.search(req_low):
+            _bump()
             await route.abort()
             return
         if _is_blocked_url_for_playwright_proxy(req_url):
+            _bump()
             await route.abort()
             return
 
         # Aggressive bandwidth saving on proxy path:
         # block third-party domains and keep same-site traffic only.
         if target_root and req_host and not _is_same_site(req_host, target_root):
+            _bump()
             await route.abort()
             return
 
@@ -569,7 +594,62 @@ def _playwright_proxy_is_disabled() -> bool:
     return _PLAYWRIGHT_PROXY_DISABLED_REASON is not None
 
 
-async def fetch_html_playwright_proxy(url: str, timeout: float = 10.0) -> str:
+def _playwright_optimize_enabled() -> bool:
+    """PLAYWRIGHT_PROXY_OPTIMIZE=0 לכיבוי; PLAYWRIGHT_PROXY_OPTIMIZE_LEGACY=1 לכפיית נתיב ישן (ללא שינוי התנהגות)."""
+    if (os.getenv("PLAYWRIGHT_PROXY_OPTIMIZE_LEGACY") or "").strip().lower() in ("1", "true", "yes", "on"):
+        return False
+    return (os.getenv("PLAYWRIGHT_PROXY_OPTIMIZE") or "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def _playwright_block_stylesheets_env() -> bool:
+    """ברירת מחדל כבוי — חסימת CSS עלולה לשבור תצוגת מחיר בדפים נדירים."""
+    return (os.getenv("PLAYWRIGHT_PROXY_BLOCK_STYLESHEETS") or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _playwright_early_challenge_enabled() -> bool:
+    if not _playwright_optimize_enabled():
+        return False
+    return (os.getenv("PLAYWRIGHT_PROXY_EARLY_CHALLENGE") or "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def _playwright_early_selector_enabled() -> bool:
+    if not _playwright_optimize_enabled():
+        return False
+    return (os.getenv("PLAYWRIGHT_PROXY_EARLY_SELECTOR") or "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def _log_playwright_proxy_metrics(
+    url: str,
+    *,
+    heavy_fetch_optimized: bool,
+    blocked_resource_count: int,
+    early_stop_reason: str | None,
+    used_full_html: bool,
+    reused_browser_context: bool,
+    fallback_to_legacy_flow: bool,
+) -> None:
+    approx = blocked_resource_count * 25_000
+    log.warning(
+        "playwright_proxy_metrics url=%s heavy_fetch_optimized=%s blocked_resource_count=%s "
+        "estimated_bytes_saved_approx=%s early_stop_reason=%s used_full_html=%s "
+        "reused_browser_context=%s fallback_to_legacy_flow=%s",
+        url,
+        heavy_fetch_optimized,
+        blocked_resource_count,
+        approx,
+        early_stop_reason or "-",
+        used_full_html,
+        reused_browser_context,
+        fallback_to_legacy_flow,
+    )
+
+
+async def fetch_html_playwright_proxy(
+    url: str,
+    timeout: float = 10.0,
+    *,
+    early_stop_css_selector: str | None = None,
+) -> str:
     """משיכת HTML דרך Playwright + פרוקסי חיצוני (PROXY_SERVER)."""
     global _PLAYWRIGHT_PROXY_DISABLED_REASON
     if _playwright_proxy_is_disabled():
@@ -649,7 +729,17 @@ async def fetch_html_playwright_proxy(url: str, timeout: float = 10.0) -> str:
             )
             page = await context.new_page()
             log.warning("playwright_proxy page_opened url=%s", url)
-            await page.route("**/*", _build_playwright_proxy_route_interceptor(url))
+            use_opt = _playwright_optimize_enabled()
+            block_ss = use_opt and _playwright_block_stylesheets_env()
+            route_stats: dict | None = {"blocked": 0} if use_opt else None
+            await page.route(
+                "**/*",
+                _build_playwright_proxy_route_interceptor(
+                    url,
+                    stats=route_stats,
+                    block_stylesheets=block_ss,
+                ),
+            )
             log.warning("playwright_proxy route_interceptor_enabled url=%s", url)
             nav_timeout_ms = max(int(timeout * 1000), 20_000)
             log.warning(
@@ -705,6 +795,20 @@ async def fetch_html_playwright_proxy(url: str, timeout: float = 10.0) -> str:
                             url,
                             block_type or "-",
                         )
+                    if use_opt:
+                        try:
+                            await page.evaluate("() => window.stop()")
+                        except Exception:
+                            pass
+                    _log_playwright_proxy_metrics(
+                        url,
+                        heavy_fetch_optimized=use_opt,
+                        blocked_resource_count=int(route_stats["blocked"]) if route_stats else 0,
+                        early_stop_reason="goto_timeout_recoverable",
+                        used_full_html=True,
+                        reused_browser_context=False,
+                        fallback_to_legacy_flow=False,
+                    )
                     return html
                 raise FetchHtmlError(
                     f"Playwright proxy navigation timeout after {nav_timeout_ms}ms",
@@ -716,7 +820,54 @@ async def fetch_html_playwright_proxy(url: str, timeout: float = 10.0) -> str:
                 resp.status if resp else None,
             )
             status = resp.status if resp else None
+
+            early_stop_reason: str | None = None
+            if use_opt and _playwright_early_challenge_enabled():
+                try:
+                    preview = await page.evaluate(
+                        "() => document.documentElement && document.documentElement.outerHTML "
+                        "? document.documentElement.outerHTML.slice(0, 36000) : ''",
+                    )
+                except Exception:
+                    preview = ""
+                if preview and _detect_playwright_block(preview):
+                    try:
+                        await page.evaluate("() => window.stop()")
+                    except Exception:
+                        pass
+                    early_stop_reason = "challenge_detected"
+
+            if (
+                early_stop_reason is None
+                and use_opt
+                and _playwright_early_selector_enabled()
+                and (sel_es := (early_stop_css_selector or "").strip())
+            ):
+                try:
+                    wto = min(12_000, max(3000, nav_timeout_ms // 2))
+                    await page.wait_for_selector(sel_es, timeout=wto, state="attached")
+                    try:
+                        await page.evaluate("() => window.stop()")
+                    except Exception:
+                        pass
+                    early_stop_reason = "selector_found"
+                except Exception:
+                    early_stop_reason = None
+
             html = await page.content()
+            if use_opt and early_stop_reason is None:
+                early_stop_reason = "full_load"
+
+            _log_playwright_proxy_metrics(
+                url,
+                heavy_fetch_optimized=use_opt,
+                blocked_resource_count=int(route_stats["blocked"]) if route_stats else 0,
+                early_stop_reason=early_stop_reason,
+                used_full_html=True,
+                reused_browser_context=False,
+                fallback_to_legacy_flow=False,
+            )
+
             preview = _safe_html_preview(html, 300)
             markers = _blocked_markers_found(html)
             block_type = _detect_playwright_block(html)
@@ -772,7 +923,12 @@ async def fetch_html_playwright_proxy(url: str, timeout: float = 10.0) -> str:
             pass
 
 
-def fetch_html_sync_with_fallback_meta(url: str, timeout: float = 45.0) -> FetchedHtml:
+def fetch_html_sync_with_fallback_meta(
+    url: str,
+    timeout: float = 45.0,
+    *,
+    playwright_early_stop_css_selector: str | None = None,
+) -> FetchedHtml:
     try:
         log.info("fetch stage=normal url=%s", url)
         html = _fetch_html_primary_sync(url, timeout=timeout)
@@ -801,7 +957,13 @@ def fetch_html_sync_with_fallback_meta(url: str, timeout: float = 45.0) -> Fetch
             url,
         )
         try:
-            html = asyncio.run(fetch_html_playwright_proxy(url, timeout=bl_proxy_timeout))
+            html = asyncio.run(
+                fetch_html_playwright_proxy(
+                    url,
+                    timeout=bl_proxy_timeout,
+                    early_stop_css_selector=playwright_early_stop_css_selector,
+                ),
+            )
             return FetchedHtml(html=html, strategy=FETCH_STRATEGY_PLAYWRIGHT_PROXY)
         except Exception as e3:
             log.error(
@@ -818,7 +980,12 @@ def fetch_html_sync_with_fallback_meta(url: str, timeout: float = 45.0) -> Fetch
             ) from e3
 
 
-async def fetch_html_with_fallback_meta(url: str, timeout: float = 45.0) -> FetchedHtml:
+async def fetch_html_with_fallback_meta(
+    url: str,
+    timeout: float = 45.0,
+    *,
+    playwright_early_stop_css_selector: str | None = None,
+) -> FetchedHtml:
     try:
         log.info("fetch stage=normal url=%s", url)
         html = await _fetch_html_primary(url, timeout=timeout)
@@ -847,7 +1014,11 @@ async def fetch_html_with_fallback_meta(url: str, timeout: float = 45.0) -> Fetc
             url,
         )
         try:
-            html = await fetch_html_playwright_proxy(url, timeout=bl_proxy_timeout)
+            html = await fetch_html_playwright_proxy(
+                url,
+                timeout=bl_proxy_timeout,
+                early_stop_css_selector=playwright_early_stop_css_selector,
+            )
             return FetchedHtml(html=html, strategy=FETCH_STRATEGY_PLAYWRIGHT_PROXY)
         except Exception as e3:
             log.error(
@@ -869,13 +1040,16 @@ def fetch_html_for_saved_strategy_sync(
     strategy: str | None,
     *,
     timeout_normal: float = 12.0,
+    early_stop_css_selector: str | None = None,
 ) -> str:
     """נתיב ישיר לפי אסטרטגיה שמורה לדומיין (ללא fallback עד שמפילים החוצה)."""
     s = normalize_fetch_strategy(strategy)
     if s == FETCH_STRATEGY_HTTP:
         return fetch_html_sync_no_fallback(url, timeout=timeout_normal)
     t = _fallback_stage_timeout(45.0, proxy=True)
-    return asyncio.run(fetch_html_playwright_proxy(url, timeout=t))
+    return asyncio.run(
+        fetch_html_playwright_proxy(url, timeout=t, early_stop_css_selector=early_stop_css_selector),
+    )
 
 
 async def fetch_html_for_saved_strategy(
@@ -883,12 +1057,17 @@ async def fetch_html_for_saved_strategy(
     strategy: str | None,
     *,
     timeout_normal: float = 12.0,
+    early_stop_css_selector: str | None = None,
 ) -> str:
     s = normalize_fetch_strategy(strategy)
     if s == FETCH_STRATEGY_HTTP:
         return await fetch_html_no_fallback(url, timeout=timeout_normal)
     t = _fallback_stage_timeout(45.0, proxy=True)
-    return await fetch_html_playwright_proxy(url, timeout=t)
+    return await fetch_html_playwright_proxy(
+        url,
+        timeout=t,
+        early_stop_css_selector=early_stop_css_selector,
+    )
 
 
 def fetch_html_sync_with_fallback(url: str, timeout: float = 45.0) -> str:

@@ -191,6 +191,7 @@ def run_competitor_check(session: Session, competitor_id: int) -> CompetitorChec
                 comp.url,
                 strat,
                 timeout_normal=12.0,
+                early_stop_css_selector=saved.css_selector,
             )
             fast_price = apply_saved_selector(html_fast, saved.css_selector)
             if fast_price is not None:
