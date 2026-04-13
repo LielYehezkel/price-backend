@@ -189,6 +189,22 @@ def patch_wc_product_regular_price(
         r.raise_for_status()
 
 
+def patch_wc_product_sale_price(
+    site_url: str,
+    consumer_key: str,
+    consumer_secret: str,
+    woo_product_id: int,
+    sale_price: float,
+) -> None:
+    base = site_url.rstrip("/")
+    url = f"{base}/wp-json/wc/v3/products/{woo_product_id}"
+    params = _wc_auth_params(consumer_key, consumer_secret)
+    body = {"sale_price": f"{sale_price:.2f}"}
+    with httpx.Client(timeout=30.0, follow_redirects=True) as client:
+        r = client.put(url, params=params, json=body)
+        r.raise_for_status()
+
+
 def patch_wc_product_out_of_stock(
     site_url: str,
     consumer_key: str,
@@ -201,6 +217,24 @@ def patch_wc_product_out_of_stock(
     body = {
         "stock_status": "outofstock",
         # For shops that manage stock quantities, this prevents stale in_stock state.
+        "manage_stock": False,
+    }
+    with httpx.Client(timeout=30.0, follow_redirects=True) as client:
+        r = client.put(url, params=params, json=body)
+        r.raise_for_status()
+
+
+def patch_wc_product_in_stock(
+    site_url: str,
+    consumer_key: str,
+    consumer_secret: str,
+    woo_product_id: int,
+) -> None:
+    base = site_url.rstrip("/")
+    url = f"{base}/wp-json/wc/v3/products/{woo_product_id}"
+    params = _wc_auth_params(consumer_key, consumer_secret)
+    body = {
+        "stock_status": "instock",
         "manage_stock": False,
     }
     with httpx.Client(timeout=30.0, follow_redirects=True) as client:

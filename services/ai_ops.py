@@ -37,11 +37,14 @@ _HE_NUM_WORDS = {
 
 @dataclass
 class ParsedIntent:
-    action: str  # reduce_price | out_of_stock | unknown
+    action: str  # reduce_price | out_of_stock | in_stock | bulk_reduce_price | unknown
     product_query: str
     delta_amount: float | None = None
     currency_hint: str | None = None
     confidence: float = 0.0
+    bulk_scope: str | None = None  # category | product_list
+    target_category: str | None = None
+    product_queries: list[str] | None = None
 
 
 @dataclass
@@ -66,16 +69,23 @@ def _normalize_text(s: str) -> str:
 def parse_intent_rule_based(message: str) -> ParsedIntent:
     txt = _normalize_text(message)
     action = "unknown"
+    has_restore_verbs = any(k in txt for k in ("תחזיר", "להחזיר", "החזר", "שים"))
+    has_stock_target = any(k in txt for k in ("למלאי", "במלאי", "מלאי"))
+    if has_restore_verbs and has_stock_target:
+        action = "in_stock"
+
     has_stock_words = any(k in txt for k in ("מלאי", "אזל", "לא במלאי"))
     has_reduce_words = any(k in txt for k in ("תוריד", "להוריד", "הוצא"))
-    if has_stock_words and has_reduce_words:
+    if action == "unknown" and has_stock_words and has_reduce_words:
         action = "out_of_stock"
-    if any(k in txt for k in ("תוריד את המחיר", "הורד מחיר", "להוריד מחיר", "פחות")):
+    if action == "unknown" and any(k in txt for k in ("תוריד את המחיר", "הורד מחיר", "להוריד מחיר", "פחות")):
         action = "reduce_price"
+    if action == "reduce_price" and any(k in txt for k in ("כל ", "קטגור", "רשימה", "כמה מוצרים", "מוצרים:")):
+        action = "bulk_reduce_price"
 
     delta: float | None = None
     nums = re.findall(r"(\d+(?:[.,]\d+)?)\s*(?:שח|ש\"ח|₪|nis|ils)?", txt)
-    if action == "reduce_price" and nums:
+    if action in ("reduce_price", "bulk_reduce_price") and nums:
         try:
             # Usually the last number in Hebrew command is the requested delta.
             delta = float(nums[-1].replace(",", "."))
@@ -84,7 +94,11 @@ def parse_intent_rule_based(message: str) -> ParsedIntent:
 
     product_query = txt
     # Remove obvious command words to leave a cleaner query.
-    product_query = re.sub(r"\b(תוריד|להוריד|מחיר|מהמלאי|מלאי|של|את|ב|שח|₪|nis|ils)\b", " ", product_query)
+    product_query = re.sub(
+        r"\b(תוריד|להוריד|תחזיר|להחזיר|החזר|שים|מחיר|מהמלאי|במלאי|מלאי|של|את|ב|שח|₪|nis|ils)\b",
+        " ",
+        product_query,
+    )
     product_query = re.sub(r"\s+", " ", product_query).strip()
     if not product_query:
         product_query = txt
@@ -94,7 +108,35 @@ def parse_intent_rule_based(message: str) -> ParsedIntent:
         conf = 0.7
     if action == "reduce_price" and delta is not None:
         conf = 0.8
-    return ParsedIntent(action=action, product_query=product_query, delta_amount=delta, currency_hint="ILS", confidence=conf)
+    bulk_scope: str | None = None
+    target_category: str | None = None
+    product_queries: list[str] | None = None
+    if action == "bulk_reduce_price":
+        if "קטגור" in txt:
+            bulk_scope = "category"
+            mcat = re.search(r"קטגור(?:יה|יית)?\s+([a-z0-9א-ת\s\-]+)", txt)
+            if mcat:
+                target_category = mcat.group(1).strip()
+        else:
+            bulk_scope = "product_list"
+            parts = re.split(r",| ו", txt)
+            cleaned: list[str] = []
+            for p in parts:
+                pp = re.sub(r"\b(תוריד|להוריד|מחיר|ב|שח|₪|nis|ils|מוצרים|רשימה)\b", " ", p).strip()
+                pp = re.sub(r"\s+", " ", pp)
+                if pp and len(pp) >= 3:
+                    cleaned.append(pp)
+            product_queries = cleaned or [product_query]
+    return ParsedIntent(
+        action=action,
+        product_query=product_query,
+        delta_amount=delta,
+        currency_hint="ILS",
+        confidence=conf,
+        bulk_scope=bulk_scope,
+        target_category=target_category,
+        product_queries=product_queries,
+    )
 
 
 async def parse_intent_with_openai(message: str) -> ParsedIntent:
@@ -103,18 +145,33 @@ async def parse_intent_with_openai(message: str) -> ParsedIntent:
     sys = (
         "You parse Hebrew ecommerce admin commands into strict JSON."
         " Return only action/product_query/delta_amount/currency_hint/confidence."
-        " action must be one of: reduce_price,out_of_stock,unknown."
+        " action must be one of: reduce_price,out_of_stock,in_stock,bulk_reduce_price,unknown."
     )
     schema = {
         "type": "object",
         "properties": {
-            "action": {"type": "string", "enum": ["reduce_price", "out_of_stock", "unknown"]},
+            "action": {
+                "type": "string",
+                "enum": ["reduce_price", "out_of_stock", "in_stock", "bulk_reduce_price", "unknown"],
+            },
             "product_query": {"type": "string"},
             "delta_amount": {"type": ["number", "null"]},
             "currency_hint": {"type": ["string", "null"]},
             "confidence": {"type": "number"},
+            "bulk_scope": {"type": ["string", "null"], "enum": ["category", "product_list", None]},
+            "target_category": {"type": ["string", "null"]},
+            "product_queries": {"type": ["array", "null"], "items": {"type": "string"}},
         },
-        "required": ["action", "product_query", "delta_amount", "currency_hint", "confidence"],
+        "required": [
+            "action",
+            "product_query",
+            "delta_amount",
+            "currency_hint",
+            "confidence",
+            "bulk_scope",
+            "target_category",
+            "product_queries",
+        ],
         "additionalProperties": False,
     }
     body = {
@@ -150,6 +207,13 @@ async def parse_intent_with_openai(message: str) -> ParsedIntent:
             delta_amount=float(parsed["delta_amount"]) if parsed.get("delta_amount") is not None else None,
             currency_hint=(str(parsed.get("currency_hint")) if parsed.get("currency_hint") else None),
             confidence=float(parsed.get("confidence") or 0.0),
+            bulk_scope=(str(parsed.get("bulk_scope")) if parsed.get("bulk_scope") else None),
+            target_category=(str(parsed.get("target_category")) if parsed.get("target_category") else None),
+            product_queries=(
+                [str(x) for x in parsed.get("product_queries", []) if str(x).strip()]
+                if parsed.get("product_queries") is not None
+                else None
+            ),
         )
     except Exception:
         return parse_intent_rule_based(message)

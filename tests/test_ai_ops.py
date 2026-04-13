@@ -16,6 +16,11 @@ class TestAiOps(unittest.TestCase):
         self.assertEqual(intent.action, "out_of_stock")
         self.assertIn("בורדו", intent.product_query)
 
+    def test_parse_restore_stock_command(self) -> None:
+        intent = parse_intent_rule_based("תחזיר את בורדו 4 מושבים למלאי")
+        self.assertEqual(intent.action, "in_stock")
+        self.assertIn("בורדו", intent.product_query)
+
     def test_rank_candidates_prefers_best_match(self) -> None:
         products = [
             Product(id=1, shop_id=1, name="ספת בורדו 4 מושבים", regular_price=3000),

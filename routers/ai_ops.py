@@ -1,21 +1,28 @@
 from __future__ import annotations
 
+import json
+import secrets
+from datetime import timedelta
 from typing import Annotated, Any, Literal
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 from sqlmodel import Session, select
 
 from backend.config import settings
 from backend.db import get_session
 from backend.deps import get_current_user, require_shop_access
-from backend.models import Product, User
+from backend.models import Product, ShopAiActionLog, ShopWhatsappConfig, User, utcnow
 from backend.services.ai_ops import parse_intent_with_openai, rank_product_candidates
 from backend.services.woo_sync import (
     fetch_wc_product_by_id,
+    parse_price,
+    patch_wc_product_in_stock,
     patch_wc_product_out_of_stock,
     patch_wc_product_regular_price,
+    patch_wc_product_sale_price,
 )
+from backend.services.whatsapp_cloud import send_test_text_message, validate_phone_number_id
 
 router = APIRouter(prefix="/api/shops", tags=["ai-ops"])
 
@@ -33,7 +40,7 @@ class ChatCandidateOut(BaseModel):
 
 class ChatPlanOut(BaseModel):
     status: Literal["needs_confirmation", "needs_disambiguation", "cannot_plan"]
-    action: Literal["reduce_price", "out_of_stock", "unknown"]
+    action: Literal["reduce_price", "out_of_stock", "in_stock", "bulk_reduce_price", "unknown"]
     question: str
     product_id: int | None = None
     product_name: str | None = None
@@ -57,11 +64,17 @@ class ChatConfirmOut(BaseModel):
     product_name: str | None = None
     before: dict[str, Any] | None = None
     after: dict[str, Any] | None = None
+    action_log_id: int | None = None
 
 
 def _ensure_chat_enabled() -> None:
     if not settings.ai_chat_enabled:
         raise HTTPException(404, "פיצ'ר צ'אט AI כבוי כרגע")
+
+
+def _ensure_woo_connected(shop) -> None:
+    if not shop.woo_site_url or not shop.woo_consumer_key or not shop.woo_consumer_secret:
+        raise HTTPException(400, "יש לשמור פרטי WooCommerce בהגדרות החנות כדי לבצע פעולה זו.")
 
 
 def _build_confirmation_for_price(name: str, old_price: float, new_price: float) -> str:
@@ -70,6 +83,40 @@ def _build_confirmation_for_price(name: str, old_price: float, new_price: float)
 
 def _build_confirmation_for_stock(name: str) -> str:
     return f'האם להוריד את המוצר "{name}" מהמלאי?'
+
+
+def _build_confirmation_for_restore_stock(name: str) -> str:
+    return f'האם להחזיר את המוצר "{name}" למלאי?'
+
+
+def _build_confirmation_for_bulk_reduce(count: int, delta: float, scope_label: str) -> str:
+    return f'האם להוריד {delta:,.2f} ש"ח ל-{count} מוצרים ({scope_label})?'
+
+
+def _log_ai_action(
+    session: Session,
+    *,
+    shop_id: int,
+    user_id: int,
+    action: str,
+    payload: dict[str, Any],
+    product_id: int | None = None,
+) -> ShopAiActionLog:
+    now = utcnow()
+    row = ShopAiActionLog(
+        shop_id=shop_id,
+        user_id=user_id,
+        action=action,
+        product_id=product_id,
+        payload_json=json.dumps(payload, ensure_ascii=False),
+        status="executed",
+        created_at=now,
+        undo_deadline_at=now + timedelta(minutes=5),
+    )
+    session.add(row)
+    session.commit()
+    session.refresh(row)
+    return row
 
 
 @router.post("/{shop_id}/ai/chat/plan", response_model=ChatPlanOut)
@@ -86,17 +133,121 @@ async def plan_chat_action(
         raise HTTPException(400, "הודעה חסרה")
 
     intent = await parse_intent_with_openai(msg)
-    if intent.action not in ("reduce_price", "out_of_stock"):
+    if intent.action not in ("reduce_price", "out_of_stock", "in_stock", "bulk_reduce_price"):
         return ChatPlanOut(status="cannot_plan", action="unknown", question="לא זיהיתי פעולה נתמכת בהודעה.")
 
     products = session.exec(select(Product).where(Product.shop_id == shop.id)).all()
     if not products:
         return ChatPlanOut(status="cannot_plan", action=intent.action, question="לא נמצאו מוצרים בחנות.")
+    try:
+        _ensure_woo_connected(shop)
+    except HTTPException as ex:
+        return ChatPlanOut(status="cannot_plan", action=intent.action, question=str(ex.detail))
+
+    if intent.action == "bulk_reduce_price":
+        if intent.delta_amount is None or intent.delta_amount <= 0:
+            return ChatPlanOut(
+                status="cannot_plan",
+                action="bulk_reduce_price",
+                question='לא זיהיתי בכמה להוריד לכל מוצר. נסה לכתוב למשל: "תוריד 50 ש"ח לכל קטגוריית ...".',
+            )
+        selected: list[Product] = []
+        scope_label = "רשימת מוצרים"
+        if intent.bulk_scope == "category" and (intent.target_category or "").strip():
+            cat_q = (intent.target_category or "").strip().lower()
+            selected = [p for p in products if (p.category_name or "").strip().lower() == cat_q]
+            if not selected:
+                selected = [p for p in products if cat_q in (p.category_name or "").strip().lower()]
+            scope_label = f"קטגוריה: {intent.target_category}"
+        else:
+            qlist = intent.product_queries or [intent.product_query or msg]
+            picked: set[int] = set()
+            for q in qlist:
+                ranked_q = rank_product_candidates(q, products, top_k=3)
+                if not ranked_q:
+                    continue
+                best = ranked_q[0]
+                if best.score < 0.45 or best.product_id in picked:
+                    continue
+                p = session.get(Product, best.product_id)
+                if p and p.shop_id == shop.id:
+                    selected.append(p)
+                    picked.add(p.id or 0)
+        if not selected:
+            return ChatPlanOut(
+                status="cannot_plan",
+                action="bulk_reduce_price",
+                question="לא הצלחתי להרכיב רשימת מוצרים תקינה לפעולת bulk.",
+            )
+
+        ops: list[dict[str, Any]] = []
+        sample_names: list[str] = []
+        for p in selected:
+            if not p.woo_product_id:
+                continue
+            wc_row = fetch_wc_product_by_id(
+                shop.woo_site_url,
+                shop.woo_consumer_key,
+                shop.woo_consumer_secret,
+                int(p.woo_product_id),
+            )
+            sale_now = parse_price(wc_row.get("sale_price"))
+            regular_now = parse_price(wc_row.get("regular_price")) if wc_row else None
+            price_field = "regular_price"
+            from_price_val = regular_now if regular_now is not None else p.regular_price
+            if sale_now is not None and sale_now > 0:
+                price_field = "sale_price"
+                from_price_val = sale_now
+            if from_price_val is None:
+                continue
+            to_price_val = max(0.0, float(from_price_val) - float(intent.delta_amount))
+            ops.append(
+                {
+                    "product_id": p.id,
+                    "woo_product_id": int(p.woo_product_id),
+                    "product_name": p.name,
+                    "price_field": price_field,
+                    "from_price": float(from_price_val),
+                    "to_price": float(to_price_val),
+                },
+            )
+            if len(sample_names) < 4:
+                sample_names.append(p.name)
+        if not ops:
+            return ChatPlanOut(
+                status="cannot_plan",
+                action="bulk_reduce_price",
+                question="לא נמצאו מוצרים עם מחיר פעיל לעדכון.",
+            )
+
+        q = _build_confirmation_for_bulk_reduce(len(ops), float(intent.delta_amount), scope_label)
+        if sample_names:
+            q = f'{q}\nדוגמאות: {", ".join(sample_names)}'
+        return ChatPlanOut(
+            status="needs_confirmation",
+            action="bulk_reduce_price",
+            question=q,
+            delta_amount=float(intent.delta_amount),
+            confirm_payload={
+                "action": "bulk_reduce_price",
+                "scope_label": scope_label,
+                "delta_amount": float(intent.delta_amount),
+                "operations": ops,
+            },
+            candidates=[
+                ChatCandidateOut(
+                    product_id=int(op["product_id"]),
+                    name=str(op["product_name"]),
+                    score=1.0,
+                    current_price=float(op["from_price"]),
+                )
+                for op in ops[:10]
+            ],
+        )
 
     ranked = rank_product_candidates(intent.product_query or msg, products, top_k=5)
     if not ranked:
         return ChatPlanOut(status="cannot_plan", action=intent.action, question="לא הצלחתי לזהות מוצר מתאים.")
-
     best = ranked[0]
     second = ranked[1] if len(ranked) > 1 else None
     ambiguous = second is not None and second.score >= best.score - 0.08
@@ -125,46 +276,70 @@ async def plan_chat_action(
             return ChatPlanOut(
                 status="cannot_plan",
                 action="reduce_price",
-                question="לא זיהיתי בכמה להוריד את המחיר. נסה לכתוב למשל: ב-50 ש\"ח",
+                question='לא זיהיתי בכמה להוריד את המחיר. נסה לכתוב למשל: "ב-50 ש"ח".',
             )
-        if target.regular_price is None:
+        if not target.woo_product_id:
+            return ChatPlanOut(
+                status="cannot_plan",
+                action="reduce_price",
+                question=f'למוצר "{target.name}" אין מזהה WooCommerce תקין.',
+            )
+        wc_row = fetch_wc_product_by_id(
+            shop.woo_site_url,
+            shop.woo_consumer_key,
+            shop.woo_consumer_secret,
+            int(target.woo_product_id),
+        )
+        sale_now = parse_price(wc_row.get("sale_price"))
+        regular_now = parse_price(wc_row.get("regular_price")) if wc_row else None
+        price_field = "regular_price"
+        from_price_val = regular_now if regular_now is not None else target.regular_price
+        if sale_now is not None and sale_now > 0:
+            price_field = "sale_price"
+            from_price_val = sale_now
+        if from_price_val is None:
             return ChatPlanOut(
                 status="cannot_plan",
                 action="reduce_price",
                 question=f'למוצר "{target.name}" אין מחיר נוכחי במערכת.',
             )
-        new_price = max(0.0, float(target.regular_price) - float(intent.delta_amount))
-        question = _build_confirmation_for_price(target.name, float(target.regular_price), new_price)
-        payload = {
-            "action": "reduce_price",
-            "product_id": target.id,
-            "delta_amount": float(intent.delta_amount),
-            "to_price": float(new_price),
-        }
+        new_price = max(0.0, float(from_price_val) - float(intent.delta_amount))
         return ChatPlanOut(
             status="needs_confirmation",
             action="reduce_price",
-            question=question,
+            question=_build_confirmation_for_price(target.name, float(from_price_val), new_price),
             product_id=target.id,
             product_name=target.name,
             delta_amount=float(intent.delta_amount),
-            from_price=float(target.regular_price),
+            from_price=float(from_price_val),
             to_price=float(new_price),
             currency=shop.woo_currency or "ILS",
-            confirm_payload=payload,
+            confirm_payload={
+                "action": "reduce_price",
+                "product_id": target.id,
+                "delta_amount": float(intent.delta_amount),
+                "to_price": float(new_price),
+                "price_field": price_field,
+            },
         )
 
-    payload = {
-        "action": "out_of_stock",
-        "product_id": target.id,
-    }
+    if intent.action == "in_stock":
+        return ChatPlanOut(
+            status="needs_confirmation",
+            action="in_stock",
+            question=_build_confirmation_for_restore_stock(target.name),
+            product_id=target.id,
+            product_name=target.name,
+            confirm_payload={"action": "in_stock", "product_id": target.id},
+        )
+
     return ChatPlanOut(
         status="needs_confirmation",
         action="out_of_stock",
         question=_build_confirmation_for_stock(target.name),
         product_id=target.id,
         product_name=target.name,
-        confirm_payload=payload,
+        confirm_payload={"action": "out_of_stock", "product_id": target.id},
     )
 
 
@@ -179,21 +354,103 @@ def confirm_chat_action(
     shop = require_shop_access(session, user, shop_id)
     payload = body.payload or {}
     action = str(payload.get("action") or "")
+    if not body.approved:
+        return ChatConfirmOut(status="cancelled", action=action)
+    _ensure_woo_connected(shop)
+
+    if action == "bulk_reduce_price":
+        operations = payload.get("operations")
+        if not isinstance(operations, list) or not operations:
+            raise HTTPException(400, "payload לא תקין: operations חסר")
+        applied: list[dict[str, Any]] = []
+        for op in operations:
+            if not isinstance(op, dict):
+                continue
+            woo_id = int(op.get("woo_product_id"))
+            pid = int(op.get("product_id"))
+            to_price = float(op.get("to_price"))
+            price_field = str(op.get("price_field") or "regular_price")
+            pname = str(op.get("product_name") or "")
+            before_row = fetch_wc_product_by_id(
+                shop.woo_site_url,
+                shop.woo_consumer_key,
+                shop.woo_consumer_secret,
+                woo_id,
+            )
+            before = {
+                "regular_price": parse_price(before_row.get("regular_price")),
+                "sale_price": parse_price(before_row.get("sale_price")),
+                "price_field": price_field,
+            }
+            if price_field == "sale_price":
+                patch_wc_product_sale_price(
+                    shop.woo_site_url,
+                    shop.woo_consumer_key,
+                    shop.woo_consumer_secret,
+                    woo_id,
+                    to_price,
+                )
+            else:
+                patch_wc_product_regular_price(
+                    shop.woo_site_url,
+                    shop.woo_consumer_key,
+                    shop.woo_consumer_secret,
+                    woo_id,
+                    to_price,
+                )
+                p_row = session.get(Product, pid)
+                if p_row and p_row.shop_id == shop_id:
+                    p_row.regular_price = to_price
+                    session.add(p_row)
+            after_row = fetch_wc_product_by_id(
+                shop.woo_site_url,
+                shop.woo_consumer_key,
+                shop.woo_consumer_secret,
+                woo_id,
+            )
+            applied.append(
+                {
+                    "product_id": pid,
+                    "woo_product_id": woo_id,
+                    "product_name": pname,
+                    "price_field": price_field,
+                    "before": before,
+                    "after": {
+                        "regular_price": parse_price(after_row.get("regular_price")),
+                        "sale_price": parse_price(after_row.get("sale_price")),
+                    },
+                },
+            )
+        session.commit()
+        log_row = _log_ai_action(
+            session,
+            shop_id=shop_id,
+            user_id=user.id or 0,
+            action="bulk_reduce_price",
+            payload={
+                "scope_label": payload.get("scope_label"),
+                "delta_amount": payload.get("delta_amount"),
+                "operations": applied,
+            },
+        )
+        return ChatConfirmOut(
+            status="executed",
+            action="bulk_reduce_price",
+            before={"count": len(applied)},
+            after={"count": len(applied), "sample": applied[:3]},
+            action_log_id=log_row.id,
+        )
+
     product_id_raw = payload.get("product_id")
     try:
         product_id = int(product_id_raw)
     except (TypeError, ValueError):
         raise HTTPException(400, "payload לא תקין: product_id חסר") from None
-
     p = session.get(Product, product_id)
     if not p or p.shop_id != shop_id:
         raise HTTPException(404, "מוצר לא נמצא")
-    if not body.approved:
-        return ChatConfirmOut(status="cancelled", action=action, product_id=p.id, product_name=p.name)
     if not p.woo_product_id:
         raise HTTPException(400, "למוצר אין מזהה WooCommerce ולכן אי אפשר לבצע פעולה זו.")
-    if not shop.woo_site_url or not shop.woo_consumer_key or not shop.woo_consumer_secret:
-        raise HTTPException(400, "יש לשמור פרטי WooCommerce בהגדרות")
 
     if action == "reduce_price":
         to_price_raw = payload.get("to_price")
@@ -201,25 +458,72 @@ def confirm_chat_action(
             to_price = float(to_price_raw)
         except (TypeError, ValueError):
             raise HTTPException(400, "payload לא תקין: to_price חסר") from None
-        before = {"regular_price": p.regular_price}
-        patch_wc_product_regular_price(
+        price_field = str(payload.get("price_field") or "regular_price")
+        row_before = fetch_wc_product_by_id(
             shop.woo_site_url,
             shop.woo_consumer_key,
             shop.woo_consumer_secret,
             int(p.woo_product_id),
-            to_price,
         )
-        p.regular_price = to_price
-        session.add(p)
+        before = {
+            "regular_price": parse_price(row_before.get("regular_price")),
+            "sale_price": parse_price(row_before.get("sale_price")),
+            "price_field": price_field,
+        }
+        if price_field == "sale_price":
+            patch_wc_product_sale_price(
+                shop.woo_site_url,
+                shop.woo_consumer_key,
+                shop.woo_consumer_secret,
+                int(p.woo_product_id),
+                to_price,
+            )
+        else:
+            patch_wc_product_regular_price(
+                shop.woo_site_url,
+                shop.woo_consumer_key,
+                shop.woo_consumer_secret,
+                int(p.woo_product_id),
+                to_price,
+            )
+            p.regular_price = to_price
+            session.add(p)
         session.commit()
-        session.refresh(p)
+        row_after = fetch_wc_product_by_id(
+            shop.woo_site_url,
+            shop.woo_consumer_key,
+            shop.woo_consumer_secret,
+            int(p.woo_product_id),
+        )
+        log_row = _log_ai_action(
+            session,
+            shop_id=shop_id,
+            user_id=user.id or 0,
+            action="reduce_price",
+            product_id=p.id,
+            payload={
+                "price_field": price_field,
+                "product_id": p.id,
+                "woo_product_id": int(p.woo_product_id),
+                "before": before,
+                "after": {
+                    "regular_price": parse_price(row_after.get("regular_price")),
+                    "sale_price": parse_price(row_after.get("sale_price")),
+                },
+            },
+        )
         return ChatConfirmOut(
             status="executed",
             action="reduce_price",
             product_id=p.id,
             product_name=p.name,
             before=before,
-            after={"regular_price": p.regular_price},
+            after={
+                "regular_price": parse_price(row_after.get("regular_price")),
+                "sale_price": parse_price(row_after.get("sale_price")),
+                "price_field": price_field,
+            },
+            action_log_id=log_row.id,
         )
 
     if action == "out_of_stock":
@@ -236,6 +540,19 @@ def confirm_chat_action(
             shop.woo_consumer_secret,
             int(p.woo_product_id),
         )
+        log_row = _log_ai_action(
+            session,
+            shop_id=shop_id,
+            user_id=user.id or 0,
+            action="out_of_stock",
+            product_id=p.id,
+            payload={
+                "product_id": p.id,
+                "woo_product_id": int(p.woo_product_id),
+                "before": {"stock_status": before_status},
+                "after": {"stock_status": "outofstock"},
+            },
+        )
         return ChatConfirmOut(
             status="executed",
             action="out_of_stock",
@@ -243,7 +560,527 @@ def confirm_chat_action(
             product_name=p.name,
             before={"stock_status": before_status},
             after={"stock_status": "outofstock"},
+            action_log_id=log_row.id,
+        )
+
+    if action == "in_stock":
+        row_before = fetch_wc_product_by_id(
+            shop.woo_site_url,
+            shop.woo_consumer_key,
+            shop.woo_consumer_secret,
+            int(p.woo_product_id),
+        )
+        before_status = str(row_before.get("stock_status") or "")
+        patch_wc_product_in_stock(
+            shop.woo_site_url,
+            shop.woo_consumer_key,
+            shop.woo_consumer_secret,
+            int(p.woo_product_id),
+        )
+        log_row = _log_ai_action(
+            session,
+            shop_id=shop_id,
+            user_id=user.id or 0,
+            action="in_stock",
+            product_id=p.id,
+            payload={
+                "product_id": p.id,
+                "woo_product_id": int(p.woo_product_id),
+                "before": {"stock_status": before_status},
+                "after": {"stock_status": "instock"},
+            },
+        )
+        return ChatConfirmOut(
+            status="executed",
+            action="in_stock",
+            product_id=p.id,
+            product_name=p.name,
+            before={"stock_status": before_status},
+            after={"stock_status": "instock"},
+            action_log_id=log_row.id,
         )
 
     raise HTTPException(400, "פעולה לא נתמכת")
 
+
+class AiActionLogOut(BaseModel):
+    id: int
+    action: str
+    status: str
+    product_id: int | None
+    created_at: str
+    undo_deadline_at: str | None
+    undone_at: str | None
+    payload: dict[str, Any]
+
+
+@router.get("/{shop_id}/ai/actions", response_model=list[AiActionLogOut])
+def list_ai_actions(
+    shop_id: int,
+    session: Annotated[Session, Depends(get_session)],
+    user: Annotated[User, Depends(get_current_user)],
+    limit: int = Query(50, ge=1, le=200),
+) -> list[AiActionLogOut]:
+    require_shop_access(session, user, shop_id)
+    rows = session.exec(
+        select(ShopAiActionLog).where(ShopAiActionLog.shop_id == shop_id).order_by(ShopAiActionLog.id.desc()).limit(limit),
+    ).all()
+    out: list[AiActionLogOut] = []
+    for r in rows:
+        try:
+            payload = json.loads(r.payload_json or "{}")
+        except Exception:
+            payload = {}
+        out.append(
+            AiActionLogOut(
+                id=r.id or 0,
+                action=r.action,
+                status=r.status,
+                product_id=r.product_id,
+                created_at=r.created_at.isoformat(),
+                undo_deadline_at=r.undo_deadline_at.isoformat() if r.undo_deadline_at else None,
+                undone_at=r.undone_at.isoformat() if r.undone_at else None,
+                payload=payload,
+            ),
+        )
+    return out
+
+
+class UndoOut(BaseModel):
+    ok: bool
+    action_id: int
+    status: str
+    detail: str
+
+
+@router.post("/{shop_id}/ai/actions/{action_id}/undo", response_model=UndoOut)
+def undo_ai_action(
+    shop_id: int,
+    action_id: int,
+    session: Annotated[Session, Depends(get_session)],
+    user: Annotated[User, Depends(get_current_user)],
+) -> UndoOut:
+    shop = require_shop_access(session, user, shop_id)
+    row = session.get(ShopAiActionLog, action_id)
+    if not row or row.shop_id != shop_id:
+        raise HTTPException(404, "פעולה לא נמצאה")
+    if row.status != "executed":
+        raise HTTPException(400, "הפעולה לא ניתנת לביטול")
+    if row.undo_deadline_at is None or utcnow() > row.undo_deadline_at:
+        row.status = "undo_expired"
+        row.undo_note = "window expired"
+        session.add(row)
+        session.commit()
+        return UndoOut(ok=False, action_id=action_id, status=row.status, detail="חלון הזמן לביטול פג")
+    _ensure_woo_connected(shop)
+    try:
+        payload = json.loads(row.payload_json or "{}")
+    except Exception:
+        payload = {}
+    try:
+        if row.action == "reduce_price":
+            woo_id = int(payload.get("woo_product_id"))
+            price_field = str(payload.get("price_field") or "regular_price")
+            before = payload.get("before") or {}
+            old_val = before.get("sale_price" if price_field == "sale_price" else "regular_price")
+            if old_val is None:
+                raise ValueError("missing previous price")
+            if price_field == "sale_price":
+                patch_wc_product_sale_price(
+                    shop.woo_site_url,
+                    shop.woo_consumer_key,
+                    shop.woo_consumer_secret,
+                    woo_id,
+                    float(old_val),
+                )
+            else:
+                patch_wc_product_regular_price(
+                    shop.woo_site_url,
+                    shop.woo_consumer_key,
+                    shop.woo_consumer_secret,
+                    woo_id,
+                    float(old_val),
+                )
+                pid = payload.get("product_id")
+                p = session.get(Product, int(pid)) if pid is not None else None
+                if p and p.shop_id == shop_id:
+                    p.regular_price = float(old_val)
+                    session.add(p)
+        elif row.action == "out_of_stock":
+            patch_wc_product_in_stock(
+                shop.woo_site_url,
+                shop.woo_consumer_key,
+                shop.woo_consumer_secret,
+                int(payload.get("woo_product_id")),
+            )
+        elif row.action == "in_stock":
+            patch_wc_product_out_of_stock(
+                shop.woo_site_url,
+                shop.woo_consumer_key,
+                shop.woo_consumer_secret,
+                int(payload.get("woo_product_id")),
+            )
+        elif row.action == "bulk_reduce_price":
+            ops = payload.get("operations")
+            if not isinstance(ops, list):
+                raise ValueError("missing bulk operations")
+            for op in ops:
+                if not isinstance(op, dict):
+                    continue
+                woo_id = int(op.get("woo_product_id"))
+                price_field = str(op.get("price_field") or "regular_price")
+                before = op.get("before") or {}
+                old_val = before.get("sale_price" if price_field == "sale_price" else "regular_price")
+                if old_val is None:
+                    continue
+                if price_field == "sale_price":
+                    patch_wc_product_sale_price(
+                        shop.woo_site_url,
+                        shop.woo_consumer_key,
+                        shop.woo_consumer_secret,
+                        woo_id,
+                        float(old_val),
+                    )
+                else:
+                    patch_wc_product_regular_price(
+                        shop.woo_site_url,
+                        shop.woo_consumer_key,
+                        shop.woo_consumer_secret,
+                        woo_id,
+                        float(old_val),
+                    )
+                    pid = op.get("product_id")
+                    p = session.get(Product, int(pid)) if pid is not None else None
+                    if p and p.shop_id == shop_id:
+                        p.regular_price = float(old_val)
+                        session.add(p)
+        else:
+            raise ValueError("unsupported action for undo")
+        row.status = "undone"
+        row.undone_at = utcnow()
+        row.undone_by_user_id = user.id
+        row.undo_note = "ok"
+        session.add(row)
+        session.commit()
+        return UndoOut(ok=True, action_id=action_id, status=row.status, detail="הביטול בוצע בהצלחה")
+    except Exception as ex:
+        row.status = "undo_failed"
+        row.undo_note = str(ex)
+        session.add(row)
+        session.commit()
+        return UndoOut(ok=False, action_id=action_id, status=row.status, detail=f"ביטול נכשל: {ex!s}")
+
+
+class WhatsappConfigIn(BaseModel):
+    enabled: bool
+    phone_number_id: str
+    business_account_id: str | None = None
+    verify_token: str
+    access_token: str
+
+
+class WhatsappConfigOut(BaseModel):
+    enabled: bool
+    phone_number_id: str | None
+    business_account_id: str | None
+    verify_token: str | None
+    access_token_masked: str | None
+    webhook_url: str | None
+    webhook_verify_url: str | None
+    updated_at: str | None
+
+
+def _mask_token(tok: str | None) -> str | None:
+    t = (tok or "").strip()
+    if not t:
+        return None
+    if len(t) <= 8:
+        return "*" * len(t)
+    return f"{t[:4]}...{t[-4:]}"
+
+
+def _public_api_base() -> str:
+    return (settings.public_api_base or "").strip().rstrip("/")
+
+
+def _webhook_urls(cfg: ShopWhatsappConfig | None) -> tuple[str | None, str | None]:
+    if cfg is None or not cfg.webhook_path_secret:
+        return None, None
+    base = _public_api_base()
+    if not base:
+        return None, None
+    path = f"/api/shops/ai/whatsapp/webhook/{cfg.webhook_path_secret}"
+    return f"{base}{path}", f"{base}{path}?hub.mode=subscribe&hub.verify_token=YOUR_VERIFY_TOKEN&hub.challenge=1234"
+
+
+@router.get("/{shop_id}/ai/whatsapp/config", response_model=WhatsappConfigOut)
+def get_whatsapp_config(
+    shop_id: int,
+    session: Annotated[Session, Depends(get_session)],
+    user: Annotated[User, Depends(get_current_user)],
+) -> WhatsappConfigOut:
+    require_shop_access(session, user, shop_id)
+    cfg = session.exec(select(ShopWhatsappConfig).where(ShopWhatsappConfig.shop_id == shop_id)).first()
+    wh, wh_verify = _webhook_urls(cfg)
+    return WhatsappConfigOut(
+        enabled=bool(cfg.enabled) if cfg else False,
+        phone_number_id=cfg.phone_number_id if cfg else None,
+        business_account_id=cfg.business_account_id if cfg else None,
+        verify_token=cfg.verify_token if cfg else None,
+        access_token_masked=_mask_token(cfg.access_token if cfg else None),
+        webhook_url=wh,
+        webhook_verify_url=wh_verify,
+        updated_at=cfg.updated_at.isoformat() if cfg and cfg.updated_at else None,
+    )
+
+
+@router.put("/{shop_id}/ai/whatsapp/config", response_model=WhatsappConfigOut)
+def upsert_whatsapp_config(
+    shop_id: int,
+    body: WhatsappConfigIn,
+    session: Annotated[Session, Depends(get_session)],
+    user: Annotated[User, Depends(get_current_user)],
+) -> WhatsappConfigOut:
+    require_shop_access(session, user, shop_id)
+    cfg = session.exec(select(ShopWhatsappConfig).where(ShopWhatsappConfig.shop_id == shop_id)).first()
+    if cfg is None:
+        cfg = ShopWhatsappConfig(
+            shop_id=shop_id,
+            created_by_user_id=user.id,
+            webhook_path_secret=secrets.token_urlsafe(24),
+        )
+    cfg.enabled = bool(body.enabled)
+    cfg.phone_number_id = (body.phone_number_id or "").strip() or None
+    cfg.business_account_id = (body.business_account_id or "").strip() or None
+    cfg.verify_token = (body.verify_token or "").strip() or None
+    cfg.access_token = (body.access_token or "").strip() or None
+    cfg.updated_by_user_id = user.id
+    cfg.updated_at = utcnow()
+    session.add(cfg)
+    session.commit()
+    session.refresh(cfg)
+    wh, wh_verify = _webhook_urls(cfg)
+    return WhatsappConfigOut(
+        enabled=cfg.enabled,
+        phone_number_id=cfg.phone_number_id,
+        business_account_id=cfg.business_account_id,
+        verify_token=cfg.verify_token,
+        access_token_masked=_mask_token(cfg.access_token),
+        webhook_url=wh,
+        webhook_verify_url=wh_verify,
+        updated_at=cfg.updated_at.isoformat() if cfg.updated_at else None,
+    )
+
+
+class WhatsappGuideOut(BaseModel):
+    title: str
+    steps: list[str]
+    webhook_url: str | None
+    verify_token: str | None
+    notes: list[str]
+
+
+class WhatsappValidationOut(BaseModel):
+    ok: bool
+    detail: str
+    phone_info: dict[str, Any] | None = None
+
+
+class WhatsappSendTestIn(BaseModel):
+    to_phone_e164: str
+    text: str | None = None
+
+
+class WhatsappSendTestOut(BaseModel):
+    ok: bool
+    detail: str
+    meta_response: dict[str, Any] | None = None
+
+
+class WizardStepOut(BaseModel):
+    key: str
+    title: str
+    done: bool
+    help_text: str
+
+
+class WhatsappWizardOut(BaseModel):
+    completed: bool
+    current_step_key: str
+    steps: list[WizardStepOut]
+    webhook_url: str | None
+    verify_token: str | None
+    blocking_issues: list[str] = []
+
+
+@router.get("/{shop_id}/ai/whatsapp/guide", response_model=WhatsappGuideOut)
+def whatsapp_guide(
+    shop_id: int,
+    session: Annotated[Session, Depends(get_session)],
+    user: Annotated[User, Depends(get_current_user)],
+) -> WhatsappGuideOut:
+    require_shop_access(session, user, shop_id)
+    cfg = session.exec(select(ShopWhatsappConfig).where(ShopWhatsappConfig.shop_id == shop_id)).first()
+    wh, _ = _webhook_urls(cfg)
+    verify = cfg.verify_token if cfg else None
+    return WhatsappGuideOut(
+        title="חיבור בוט החנות ל-WhatsApp Cloud API",
+        steps=[
+            "1) פתחו Meta Business והקימו WhatsApp Business Account.",
+            "2) הוסיפו מספר טלפון וקבלו Phone Number ID ו-Business Account ID.",
+            "3) במסך ההגדרות הזינו Phone Number ID, Verify Token, Access Token ולחצו שמירה.",
+            "4) העתיקו את Webhook URL שמופיע כאן ל-Meta Developers.",
+            "5) הגדירו Verify Token זהה בדיוק, ובצעו Verify and Save.",
+            "6) הירשמו ל-webhook fields: messages, message_status.",
+            "7) שלחו הודעת בדיקה במספר WhatsApp והפעילו enabled=true.",
+        ],
+        webhook_url=wh,
+        verify_token=verify,
+        notes=[
+            "לכל חנות חיבור WhatsApp נפרד (credentials נפרדים).",
+            "הבוט עובד במודל plan/confirm לפני ביצוע פעולות.",
+            "מומלץ לבצע Rotation תקופתי ל-access token.",
+        ],
+    )
+
+
+@router.post("/{shop_id}/ai/whatsapp/validate-credentials", response_model=WhatsappValidationOut)
+def whatsapp_validate_credentials(
+    shop_id: int,
+    session: Annotated[Session, Depends(get_session)],
+    user: Annotated[User, Depends(get_current_user)],
+) -> WhatsappValidationOut:
+    require_shop_access(session, user, shop_id)
+    cfg = session.exec(select(ShopWhatsappConfig).where(ShopWhatsappConfig.shop_id == shop_id)).first()
+    if not cfg:
+        return WhatsappValidationOut(ok=False, detail="חסר קונפיג WhatsApp. שמור קודם הגדרות.")
+    if not cfg.phone_number_id or not cfg.access_token:
+        return WhatsappValidationOut(ok=False, detail="חסרים Phone Number ID או Access Token.")
+    try:
+        info = validate_phone_number_id(cfg.access_token, cfg.phone_number_id)
+        return WhatsappValidationOut(ok=True, detail="הקרדנצ'לים תקינים מול Meta.", phone_info=info)
+    except Exception as ex:
+        return WhatsappValidationOut(ok=False, detail=f"אימות נכשל: {ex!s}")
+
+
+@router.post("/{shop_id}/ai/whatsapp/send-test", response_model=WhatsappSendTestOut)
+def whatsapp_send_test(
+    shop_id: int,
+    body: WhatsappSendTestIn,
+    session: Annotated[Session, Depends(get_session)],
+    user: Annotated[User, Depends(get_current_user)],
+) -> WhatsappSendTestOut:
+    require_shop_access(session, user, shop_id)
+    cfg = session.exec(select(ShopWhatsappConfig).where(ShopWhatsappConfig.shop_id == shop_id)).first()
+    if not cfg:
+        return WhatsappSendTestOut(ok=False, detail="חסר קונפיג WhatsApp. שמור קודם הגדרות.")
+    if not cfg.phone_number_id or not cfg.access_token:
+        return WhatsappSendTestOut(ok=False, detail="חסרים Phone Number ID או Access Token.")
+    txt = (body.text or "בדיקת חיבור מהעוזר האוטומטי - ההתחברות הצליחה").strip()
+    try:
+        res = send_test_text_message(cfg.access_token, cfg.phone_number_id, body.to_phone_e164, txt)
+        return WhatsappSendTestOut(ok=True, detail="הודעת בדיקה נשלחה בהצלחה.", meta_response=res)
+    except Exception as ex:
+        return WhatsappSendTestOut(ok=False, detail=f"שליחת בדיקה נכשלה: {ex!s}")
+
+
+@router.get("/{shop_id}/ai/whatsapp/wizard", response_model=WhatsappWizardOut)
+def whatsapp_wizard(
+    shop_id: int,
+    session: Annotated[Session, Depends(get_session)],
+    user: Annotated[User, Depends(get_current_user)],
+) -> WhatsappWizardOut:
+    require_shop_access(session, user, shop_id)
+    cfg = session.exec(select(ShopWhatsappConfig).where(ShopWhatsappConfig.shop_id == shop_id)).first()
+    wh, _ = _webhook_urls(cfg)
+    has_cfg = cfg is not None
+    has_ids = has_cfg and bool((cfg.phone_number_id or "").strip()) and bool((cfg.verify_token or "").strip())
+    has_token = has_cfg and bool((cfg.access_token or "").strip())
+
+    creds_ok = False
+    if has_ids and has_token and cfg:
+        try:
+            validate_phone_number_id(cfg.access_token or "", cfg.phone_number_id or "")
+            creds_ok = True
+        except Exception:
+            creds_ok = False
+    enabled = bool(cfg.enabled) if cfg else False
+
+    blocking_issues: list[str] = []
+    if not _public_api_base():
+        blocking_issues.append("הגדרת PUBLIC_API_BASE חסרה בשרת, ולכן אי אפשר להפיק Webhook URL ציבורי.")
+    if has_cfg and not has_ids:
+        blocking_issues.append("חסרים Phone Number ID או Verify Token בהגדרות החנות.")
+    if has_cfg and not has_token:
+        blocking_issues.append("חסר Access Token בהגדרות החנות.")
+
+    steps = [
+        WizardStepOut(
+            key="save_config",
+            title="שמור פרטי WhatsApp",
+            done=bool(has_ids and has_token),
+            help_text="הזן Phone Number ID, Verify Token ו-Access Token ולחץ שמירה.",
+        ),
+        WizardStepOut(
+            key="verify_credentials",
+            title="בדוק קרדנצ'לים מול Meta",
+            done=creds_ok,
+            help_text='לחץ "בדוק חיבור מול Meta". אם נכשל, עדכן token/phone id.',
+        ),
+        WizardStepOut(
+            key="set_webhook",
+            title="הגדר Webhook ב-Meta",
+            done=bool(creds_ok and wh),
+            help_text="העתק את כתובת ה-Webhook למסך WhatsApp App ב-Meta ובצע Verify and Save.",
+        ),
+        WizardStepOut(
+            key="enable_bot",
+            title="הפעל את הבוט לחנות",
+            done=enabled,
+            help_text='הפעל "enabled" לאחר שכל השלבים הושלמו.',
+        ),
+    ]
+    current = "done"
+    for s in steps:
+        if not s.done:
+            current = s.key
+            break
+    return WhatsappWizardOut(
+        completed=all(s.done for s in steps),
+        current_step_key=current,
+        steps=steps,
+        webhook_url=wh,
+        verify_token=cfg.verify_token if cfg else None,
+        blocking_issues=blocking_issues,
+    )
+
+
+@router.get("/ai/whatsapp/webhook/{secret}")
+def whatsapp_webhook_verify(
+    secret: str,
+    request: Request,
+    session: Annotated[Session, Depends(get_session)],
+):
+    cfg = session.exec(select(ShopWhatsappConfig).where(ShopWhatsappConfig.webhook_path_secret == secret)).first()
+    if not cfg:
+        raise HTTPException(404, "Webhook not found")
+    mode = request.query_params.get("hub.mode")
+    verify_token = request.query_params.get("hub.verify_token")
+    challenge = request.query_params.get("hub.challenge")
+    if mode == "subscribe" and verify_token and verify_token == (cfg.verify_token or "") and challenge is not None:
+        return int(challenge) if challenge.isdigit() else challenge
+    raise HTTPException(403, "Webhook verification failed")
+
+
+@router.post("/ai/whatsapp/webhook/{secret}")
+async def whatsapp_webhook_receive(
+    secret: str,
+    request: Request,
+    session: Annotated[Session, Depends(get_session)],
+):
+    cfg = session.exec(select(ShopWhatsappConfig).where(ShopWhatsappConfig.webhook_path_secret == secret)).first()
+    if not cfg:
+        raise HTTPException(404, "Webhook not found")
+    _ = await request.json()
+    # Infra-ready placeholder: parse incoming WA messages and map sender to shop users/permissions.
+    return {"ok": True, "shop_id": cfg.shop_id, "enabled": cfg.enabled}

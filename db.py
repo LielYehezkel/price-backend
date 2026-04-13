@@ -236,6 +236,97 @@ def _migrate_alert_kind_column() -> None:
                 pass
 
 
+def _migrate_shop_ai_action_log() -> None:
+    stmts = [
+        (
+            "shop_id",
+            "ALTER TABLE shopaiactionlog ADD COLUMN shop_id INTEGER REFERENCES shop(id)",
+        ),
+        (
+            "user_id",
+            "ALTER TABLE shopaiactionlog ADD COLUMN user_id INTEGER REFERENCES user(id)",
+        ),
+        (
+            "action",
+            "ALTER TABLE shopaiactionlog ADD COLUMN action VARCHAR",
+        ),
+        (
+            "product_id",
+            "ALTER TABLE shopaiactionlog ADD COLUMN product_id INTEGER REFERENCES product(id)",
+        ),
+        (
+            "payload_json",
+            "ALTER TABLE shopaiactionlog ADD COLUMN payload_json VARCHAR DEFAULT ''",
+        ),
+        (
+            "status",
+            "ALTER TABLE shopaiactionlog ADD COLUMN status VARCHAR DEFAULT 'executed'",
+        ),
+        (
+            "created_at",
+            "ALTER TABLE shopaiactionlog ADD COLUMN created_at TIMESTAMP",
+        ),
+        (
+            "undo_deadline_at",
+            "ALTER TABLE shopaiactionlog ADD COLUMN undo_deadline_at TIMESTAMP",
+        ),
+        (
+            "undone_at",
+            "ALTER TABLE shopaiactionlog ADD COLUMN undone_at TIMESTAMP",
+        ),
+        (
+            "undone_by_user_id",
+            "ALTER TABLE shopaiactionlog ADD COLUMN undone_by_user_id INTEGER REFERENCES user(id)",
+        ),
+        (
+            "undo_note",
+            "ALTER TABLE shopaiactionlog ADD COLUMN undo_note VARCHAR",
+        ),
+    ]
+    for _, sql in stmts:
+        with engine.begin() as conn:
+            try:
+                conn.execute(text(sql))
+            except Exception as ex:
+                if not _is_duplicate_column_error(ex):
+                    msg = str(ex).lower()
+                    # First deployment where table does not exist yet.
+                    if "no such table" not in msg and "does not exist" not in msg:
+                        log.warning("Migration failed: shopaiactionlog: %s", ex)
+
+
+def _migrate_shop_whatsapp_config() -> None:
+    stmts = [
+        (
+            "enabled",
+            "ALTER TABLE shopwhatsappconfig ADD COLUMN enabled INTEGER DEFAULT 0",
+        ),
+        ("phone_number_id", "ALTER TABLE shopwhatsappconfig ADD COLUMN phone_number_id VARCHAR"),
+        ("business_account_id", "ALTER TABLE shopwhatsappconfig ADD COLUMN business_account_id VARCHAR"),
+        ("verify_token", "ALTER TABLE shopwhatsappconfig ADD COLUMN verify_token VARCHAR"),
+        ("access_token", "ALTER TABLE shopwhatsappconfig ADD COLUMN access_token VARCHAR"),
+        ("webhook_path_secret", "ALTER TABLE shopwhatsappconfig ADD COLUMN webhook_path_secret VARCHAR"),
+        (
+            "created_by_user_id",
+            "ALTER TABLE shopwhatsappconfig ADD COLUMN created_by_user_id INTEGER REFERENCES user(id)",
+        ),
+        (
+            "updated_by_user_id",
+            "ALTER TABLE shopwhatsappconfig ADD COLUMN updated_by_user_id INTEGER REFERENCES user(id)",
+        ),
+        ("updated_at", "ALTER TABLE shopwhatsappconfig ADD COLUMN updated_at TIMESTAMP"),
+    ]
+    for _, sql in stmts:
+        with engine.begin() as conn:
+            try:
+                conn.execute(text(sql))
+            except Exception as ex:
+                if not _is_duplicate_column_error(ex):
+                    msg = str(ex).lower()
+                    if "no such table" not in msg and "does not exist" not in msg:
+                        log.warning("Migration failed: shopwhatsappconfig: %s", ex)
+
+
 def init_db() -> None:
     # Ensure all SQLModel tables are registered on metadata before create_all
     from backend import models as _models  # noqa: F401
@@ -253,6 +344,8 @@ def init_db() -> None:
     _ensure_price_sanity_defaults()
     _ensure_scheduler_heartbeat_row()
     _ensure_admin_system_config_row()
+    _migrate_shop_ai_action_log()
+    _migrate_shop_whatsapp_config()
     _migrate_competitor_link_light_html_hash()
     _migrate_domain_price_selector_fetch_strategy()
     _backfill_tracked_competitors()

@@ -313,3 +313,36 @@ class AdminOperationalLog(SQLModel, table=True):
     detail: str = ""
     shop_id: Optional[int] = Field(default=None, foreign_key="shop.id", index=True)
     competitor_link_id: Optional[int] = Field(default=None, foreign_key="competitorlink.id", index=True)
+
+
+class ShopAiActionLog(SQLModel, table=True):
+    """Audit log for AI assistant actions with undo support."""
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    shop_id: int = Field(foreign_key="shop.id", index=True)
+    user_id: int = Field(foreign_key="user.id", index=True)
+    action: str = Field(index=True)  # reduce_price | out_of_stock | in_stock | bulk_reduce_price
+    product_id: Optional[int] = Field(default=None, foreign_key="product.id", index=True)
+    payload_json: str = ""  # includes before/after and execution parameters
+    status: str = Field(default="executed", index=True)  # executed | undone | undo_expired | undo_failed
+    created_at: datetime = Field(default_factory=utcnow, index=True)
+    undo_deadline_at: Optional[datetime] = Field(default=None, index=True)
+    undone_at: Optional[datetime] = None
+    undone_by_user_id: Optional[int] = Field(default=None, foreign_key="user.id")
+    undo_note: Optional[str] = None
+
+
+class ShopWhatsappConfig(SQLModel, table=True):
+    """Per-shop WhatsApp Cloud API connector configuration."""
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    shop_id: int = Field(foreign_key="shop.id", index=True, unique=True)
+    enabled: bool = Field(default=False, index=True)
+    phone_number_id: Optional[str] = None
+    business_account_id: Optional[str] = None
+    verify_token: Optional[str] = None
+    access_token: Optional[str] = None
+    webhook_path_secret: Optional[str] = None
+    created_by_user_id: Optional[int] = Field(default=None, foreign_key="user.id")
+    updated_by_user_id: Optional[int] = Field(default=None, foreign_key="user.id")
+    updated_at: datetime = Field(default_factory=utcnow)
