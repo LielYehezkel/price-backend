@@ -48,7 +48,7 @@ from backend.services.alert_prefs import (
     load_dismissed_recommendation_ids,
     save_dismissed_recommendation_ids,
 )
-from backend.services.domain_policy import domain_from_url, domain_is_live
+from backend.services.domain_policy import clear_domain_review_pending_for_live_domain, domain_from_url, domain_is_live
 from backend.services.domain_queue_repair import (
     ensure_domain_review_queue_item_for_competitor,
     repair_missing_domain_queue_for_shop,
@@ -1595,6 +1595,11 @@ def report_competitor_price_issue(
     domain = domain_from_url(c.url)
     if not domain:
         raise HTTPException(400, "כתובת לא תקינה")
+    if domain_is_live(session, domain):
+        # כלל מערכת: דומיין חי (סלקטור קיים/מאושר) לא נכנס לתור אישור דומיינים.
+        clear_domain_review_pending_for_live_domain(session, domain)
+        session.commit()
+        return {"ok": True, "queue_item_id": None, "domain": domain, "skipped_review_queue": True}
     price: float | None = None
     cur: str | None = None
     candidates: list = []

@@ -14,7 +14,7 @@ from backend.models import (
     Product,
     utcnow,
 )
-from backend.services.domain_policy import domain_from_url, domain_is_live
+from backend.services.domain_policy import clear_domain_review_pending_for_live_domain, domain_from_url, domain_is_live
 from backend.services.extract import run_extraction_pipeline
 from backend.services.fetch_html import fetch_html_sync
 
@@ -44,6 +44,7 @@ def ensure_domain_review_queue_item_for_competitor(
         return "skipped_live"
 
     if domain_is_live(session, domain):
+        clear_domain_review_pending_for_live_domain(session, domain)
         return "skipped_live"
 
     existing = session.exec(

@@ -24,6 +24,7 @@ from backend.services.fetch_html import (
     format_fetch_error_hebrew,
     normalize_fetch_strategy,
 )
+from backend.services.domain_policy import clear_domain_review_pending_for_live_domain
 from backend.services.competitor_lightweight_precheck import LightweightCheckOutcome, lightweight_check
 from backend.services.price_resolve_lightweight_gate import (
     apply_price_resolve_lightweight_decision,
@@ -282,5 +283,7 @@ async def confirm_selector(
                 fetch_strategy=strat_save,
             )
         )
+    session.flush()
+    clear_domain_review_pending_for_live_domain(session, domain)
     session.commit()
     return {"ok": True, "domain": domain, "validated_price": price}

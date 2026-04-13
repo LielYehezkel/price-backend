@@ -10,7 +10,7 @@ from fastapi.responses import JSONResponse
 
 from backend.config import settings
 from backend.db import engine, init_db
-from backend.routers import admin, auth, integrations, plugin, price, shops
+from backend.routers import admin, ai_ops, auth, integrations, plugin, price, shops
 from backend.services.monitor_checks import run_scheduled_checks
 from backend.services.scan_engine_journal import record_tick_failure, record_tick_success
 from sqlmodel import Session
@@ -107,6 +107,7 @@ app.include_router(auth.router)
 app.include_router(admin.router)
 app.include_router(price.router)
 app.include_router(shops.router)
+app.include_router(ai_ops.router)
 app.include_router(integrations.router)
 app.include_router(plugin.router)
 

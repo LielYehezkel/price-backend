@@ -11,6 +11,9 @@ class Settings(BaseSettings):
     jwt_exp_hours: int = 72
     # כתובת ציבורית של ה-API לתוסף WordPress (בפרודקשן: https://api.example.com)
     public_api_base: str = "http://127.0.0.1:8000"
+    ai_chat_enabled: bool = False
+    openai_api_key: str | None = None
+    ai_chat_model: str = "gpt-4o-mini"
 
 
 settings = Settings()

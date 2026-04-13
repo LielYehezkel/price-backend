@@ -24,7 +24,7 @@ from backend.models import (
     utcnow,
 )
 from backend.services.price_sanity import get_settings
-from backend.services.domain_policy import iter_competitor_ids_for_domain
+from backend.services.domain_policy import clear_domain_review_pending_for_live_domain, iter_competitor_ids_for_domain
 from backend.services.domain_queue_repair import repair_all_missing_domain_queue_items_global
 from backend.services.extract import run_extraction_pipeline, validate_selector_with_fallbacks
 from backend.services.fetch_html import (
@@ -275,6 +275,7 @@ def list_domain_price_reviews(
 ):
     # כל קישור ב„בעיבוד“ חייב שורה בתור — תיקון דאטה ישן בלי קריאות רשת
     repair_all_missing_domain_queue_items_global(session, try_fetch=False)
+    cleanup_changed = 0
 
     out: list[DomainReviewRow] = []
     if status_filter == "all":
@@ -290,6 +291,9 @@ def list_domain_price_reviews(
         ).all()
 
     for it in q_items:
+        cleanup_changed += clear_domain_review_pending_for_live_domain(session, it.domain)
+        if session.get(DomainPriceSelector, it.domain):
+            continue
         cand = _parse_candidates_json(it.candidates_json)
         out.append(
             DomainReviewRow(
@@ -313,6 +317,9 @@ def list_domain_price_reviews(
         seen_domains = {row.domain for row in out}
         dpas = session.exec(select(DomainPriceApproval).where(DomainPriceApproval.status == "pending")).all()
         for dpa in dpas:
+            cleanup_changed += clear_domain_review_pending_for_live_domain(session, dpa.domain)
+            if session.get(DomainPriceSelector, dpa.domain):
+                continue
             if dpa.domain in seen_domains:
                 continue
             cand = _parse_candidates_json(dpa.candidates_json)
@@ -336,6 +343,9 @@ def list_domain_price_reviews(
             seen_domains.add(dpa.domain)
             if len(out) >= limit:
                 break
+
+    if cleanup_changed:
+        session.commit()
 
     return out
 
