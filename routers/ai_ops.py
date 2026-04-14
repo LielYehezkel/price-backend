@@ -23,7 +23,12 @@ from backend.services.woo_sync import (
     patch_wc_product_regular_price,
     patch_wc_product_sale_price,
 )
-from backend.services.whatsapp_cloud import send_interactive_confirm_buttons, send_test_text_message, validate_phone_number_id
+from backend.services.whatsapp_cloud import (
+    MetaAuthError,
+    send_interactive_confirm_buttons,
+    send_test_text_message,
+    validate_phone_number_id,
+)
 
 router = APIRouter(prefix="/api/shops", tags=["ai-ops"])
 log = logging.getLogger(__name__)
@@ -1087,6 +1092,11 @@ def whatsapp_validate_credentials(
     try:
         info = validate_phone_number_id(cfg.access_token, cfg.phone_number_id)
         return WhatsappValidationOut(ok=True, detail="הקרדנצ'לים תקינים מול Meta.", phone_info=info)
+    except MetaAuthError:
+        return WhatsappValidationOut(
+            ok=False,
+            detail="ה-Access Token של WhatsApp פג תוקף או לא תקין. יש לייצר token חדש ולעדכן בהגדרות.",
+        )
     except Exception as ex:
         return WhatsappValidationOut(ok=False, detail=f"אימות נכשל: {ex!s}")
 
@@ -1108,6 +1118,11 @@ def whatsapp_send_test(
     try:
         res = send_test_text_message(cfg.access_token, cfg.phone_number_id, body.to_phone_e164, txt)
         return WhatsappSendTestOut(ok=True, detail="הודעת בדיקה נשלחה בהצלחה.", meta_response=res)
+    except MetaAuthError:
+        return WhatsappSendTestOut(
+            ok=False,
+            detail="שליחת בדיקה נכשלה: ה-Access Token פג תוקף או לא תקין. עדכן token חדש בהגדרות.",
+        )
     except Exception as ex:
         return WhatsappSendTestOut(ok=False, detail=f"שליחת בדיקה נכשלה: {ex!s}")
 
@@ -1237,6 +1252,18 @@ async def whatsapp_webhook_receive(
                 text=text,
             )
             handled += 1
+        except MetaAuthError as ex:
+            log.error(
+                "whatsapp auth failed; disabling config shop_id=%s sender=%s err=%s",
+                cfg.shop_id,
+                sender,
+                ex,
+            )
+            cfg.enabled = False
+            cfg.updated_at = utcnow()
+            session.add(cfg)
+            session.commit()
+            break
         except Exception as ex:
             log.exception("whatsapp webhook message processing failed shop_id=%s sender=%s", cfg.shop_id, sender)
             _send_whatsapp_reply(cfg, sender, f"שגיאה בביצוע הפעולה: {ex!s}")
@@ -1405,9 +1432,11 @@ def _send_whatsapp_reply(cfg: ShopWhatsappConfig, to_phone: str, text: str) -> N
         return
     try:
         send_test_text_message(cfg.access_token, cfg.phone_number_id, to_phone, text[:1900])
+    except MetaAuthError:
+        raise
     except Exception:
         log.exception("whatsapp text reply failed shop_id=%s", cfg.shop_id)
-        # Don't raise inside webhook path; WhatsApp retries anyway and we avoid 500 loops.
+        # Keep webhook flow stable on transient send errors.
         return
 
 
@@ -1424,6 +1453,8 @@ def _send_whatsapp_confirmation(cfg: ShopWhatsappConfig, to_phone: str, question
             no_id="confirm_no",
         )
         return
+    except MetaAuthError:
+        raise
     except Exception:
         # Some environments/numbers block interactive messages; fallback to text flow.
         log.exception("whatsapp interactive send failed shop_id=%s; fallback to text", cfg.shop_id)

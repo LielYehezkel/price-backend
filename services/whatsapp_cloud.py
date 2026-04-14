@@ -8,6 +8,31 @@ import httpx
 META_GRAPH_BASE = "https://graph.facebook.com/v22.0"
 
 
+class MetaAuthError(RuntimeError):
+    pass
+
+
+def _raise_meta_error(prefix: str, response: httpx.Response) -> None:
+    body_snippet = response.text[:300]
+    msg = f"{prefix} ({response.status_code}): {body_snippet}"
+    try:
+        data = response.json()
+    except Exception:
+        data = None
+    if isinstance(data, dict):
+        err = data.get("error")
+        if isinstance(err, dict):
+            code = err.get("code")
+            subcode = err.get("error_subcode")
+            err_msg = str(err.get("message") or "")
+            if response.status_code in (401, 403) or str(code) == "190":
+                raise MetaAuthError(
+                    f"{prefix} ({response.status_code}) code={code} subcode={subcode}: {err_msg}",
+                )
+            msg = f"{prefix} ({response.status_code}) code={code} subcode={subcode}: {err_msg}"
+    raise RuntimeError(msg)
+
+
 def _auth_headers(access_token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {access_token.strip()}"}
 
@@ -18,7 +43,7 @@ def validate_phone_number_id(access_token: str, phone_number_id: str) -> dict[st
     with httpx.Client(timeout=25.0, follow_redirects=True) as client:
         r = client.get(url, headers=_auth_headers(access_token), params=params)
         if r.status_code >= 400:
-            raise RuntimeError(f"Meta validation failed ({r.status_code}): {r.text[:300]}")
+            _raise_meta_error("Meta validation failed", r)
         data = r.json()
     if not isinstance(data, dict):
         raise RuntimeError("Meta validation returned invalid response")
@@ -41,7 +66,7 @@ def send_test_text_message(
     with httpx.Client(timeout=25.0, follow_redirects=True) as client:
         r = client.post(url, headers=_auth_headers(access_token), json=body)
         if r.status_code >= 400:
-            raise RuntimeError(f"Meta send failed ({r.status_code}): {r.text[:300]}")
+            _raise_meta_error("Meta send failed", r)
         data = r.json()
     if not isinstance(data, dict):
         raise RuntimeError("Meta send returned invalid response")
@@ -75,7 +100,7 @@ def send_interactive_confirm_buttons(
     with httpx.Client(timeout=25.0, follow_redirects=True) as client:
         r = client.post(url, headers=_auth_headers(access_token), json=body)
         if r.status_code >= 400:
-            raise RuntimeError(f"Meta interactive send failed ({r.status_code}): {r.text[:300]}")
+            _raise_meta_error("Meta interactive send failed", r)
         data = r.json()
     if not isinstance(data, dict):
         raise RuntimeError("Meta interactive send returned invalid response")
