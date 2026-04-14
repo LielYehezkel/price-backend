@@ -12,7 +12,7 @@ from sqlmodel import Session, select
 from backend.config import settings
 from backend.db import get_session
 from backend.deps import get_current_user, require_shop_access
-from backend.models import Product, ShopAiActionLog, ShopWhatsappConfig, User, utcnow
+from backend.models import Product, Shop, ShopAiActionLog, ShopWhatsappConfig, ShopWhatsappPendingAction, User, utcnow
 from backend.services.ai_ops import parse_intent_with_openai, rank_product_candidates
 from backend.services.woo_sync import (
     fetch_wc_product_by_id,
@@ -1081,6 +1081,187 @@ async def whatsapp_webhook_receive(
     cfg = session.exec(select(ShopWhatsappConfig).where(ShopWhatsappConfig.webhook_path_secret == secret)).first()
     if not cfg:
         raise HTTPException(404, "Webhook not found")
-    _ = await request.json()
-    # Infra-ready placeholder: parse incoming WA messages and map sender to shop users/permissions.
-    return {"ok": True, "shop_id": cfg.shop_id, "enabled": cfg.enabled}
+    payload = await request.json()
+    if not cfg.enabled:
+        return {"ok": True, "shop_id": cfg.shop_id, "enabled": cfg.enabled, "skipped": "disabled"}
+
+    shop = session.get(Shop, cfg.shop_id)
+    if not shop:
+        return {"ok": True, "shop_id": cfg.shop_id, "enabled": cfg.enabled, "skipped": "shop_not_found"}
+    actor_user = session.get(User, shop.owner_id)
+    if not actor_user:
+        return {"ok": True, "shop_id": cfg.shop_id, "enabled": cfg.enabled, "skipped": "owner_not_found"}
+
+    messages = _extract_incoming_whatsapp_messages(payload)
+    handled = 0
+    for m in messages:
+        sender = (m.get("from") or "").strip()
+        text = (m.get("text") or "").strip()
+        if not sender or not text:
+            continue
+        await _process_whatsapp_text_message(
+            session=session,
+            cfg=cfg,
+            shop=shop,
+            actor_user=actor_user,
+            sender_phone=sender,
+            text=text,
+        )
+        handled += 1
+    return {"ok": True, "shop_id": cfg.shop_id, "enabled": cfg.enabled, "handled_messages": handled}
+
+
+def _extract_incoming_whatsapp_messages(payload: Any) -> list[dict[str, str]]:
+    out: list[dict[str, str]] = []
+    if not isinstance(payload, dict):
+        return out
+    entries = payload.get("entry")
+    if not isinstance(entries, list):
+        return out
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        changes = entry.get("changes")
+        if not isinstance(changes, list):
+            continue
+        for ch in changes:
+            if not isinstance(ch, dict):
+                continue
+            value = ch.get("value")
+            if not isinstance(value, dict):
+                continue
+            msgs = value.get("messages")
+            if not isinstance(msgs, list):
+                continue
+            for msg in msgs:
+                if not isinstance(msg, dict):
+                    continue
+                sender = str(msg.get("from") or "").strip()
+                msg_type = str(msg.get("type") or "")
+                text_val = ""
+                if msg_type == "text":
+                    t = msg.get("text")
+                    if isinstance(t, dict):
+                        text_val = str(t.get("body") or "").strip()
+                elif msg_type == "interactive":
+                    inter = msg.get("interactive")
+                    if isinstance(inter, dict):
+                        i_type = str(inter.get("type") or "")
+                        if i_type == "button_reply":
+                            br = inter.get("button_reply")
+                            if isinstance(br, dict):
+                                text_val = str(br.get("title") or br.get("id") or "").strip()
+                        elif i_type == "list_reply":
+                            lr = inter.get("list_reply")
+                            if isinstance(lr, dict):
+                                text_val = str(lr.get("title") or lr.get("id") or "").strip()
+                if sender and text_val:
+                    out.append({"from": sender, "text": text_val})
+    return out
+
+
+def _is_whatsapp_yes(text: str) -> bool:
+    t = (text or "").strip().lower()
+    return t in {"כן", "כן.", "אשר", "אישור", "בצע", "תבצע", "yes", "ok", "okay"}
+
+
+def _is_whatsapp_no(text: str) -> bool:
+    t = (text or "").strip().lower()
+    return t in {"לא", "לא.", "בטל", "ביטול", "no", "cancel"}
+
+
+async def _process_whatsapp_text_message(
+    *,
+    session: Session,
+    cfg: ShopWhatsappConfig,
+    shop: Shop,
+    actor_user: User,
+    sender_phone: str,
+    text: str,
+) -> None:
+    now = utcnow()
+    pending = session.exec(
+        select(ShopWhatsappPendingAction).where(
+            ShopWhatsappPendingAction.shop_id == (shop.id or 0),
+            ShopWhatsappPendingAction.sender_phone == sender_phone,
+        ),
+    ).first()
+    if pending and pending.expires_at < now:
+        session.delete(pending)
+        session.commit()
+        pending = None
+
+    if pending and (_is_whatsapp_yes(text) or _is_whatsapp_no(text)):
+        if _is_whatsapp_no(text):
+            session.delete(pending)
+            session.commit()
+            _send_whatsapp_reply(cfg, sender_phone, "הפעולה בוטלה. אפשר לשלוח משימה חדשה.")
+            return
+        try:
+            payload = json.loads(pending.pending_payload_json or "{}")
+        except Exception:
+            payload = {}
+        res = confirm_chat_action(
+            shop_id=int(shop.id or 0),
+            body=ChatConfirmIn(approved=True, payload=payload),
+            session=session,
+            user=actor_user,
+        )
+        session.delete(pending)
+        session.commit()
+        if res.status == "executed":
+            _send_whatsapp_reply(
+                cfg,
+                sender_phone,
+                f'בוצע בהצלחה: {res.action} עבור "{res.product_name or "המוצר"}".',
+            )
+        else:
+            _send_whatsapp_reply(cfg, sender_phone, "הפעולה לא בוצעה.")
+        return
+
+    plan = await plan_chat_action(
+        shop_id=int(shop.id or 0),
+        body=ChatPlanIn(message=text),
+        session=session,
+        user=actor_user,
+    )
+    if plan.status == "needs_confirmation" and plan.confirm_payload:
+        expires = now + timedelta(minutes=30)
+        if pending is None:
+            pending = ShopWhatsappPendingAction(
+                shop_id=int(shop.id or 0),
+                sender_phone=sender_phone,
+                pending_payload_json=json.dumps(plan.confirm_payload, ensure_ascii=False),
+                pending_question=plan.question,
+                created_at=now,
+                expires_at=expires,
+            )
+            session.add(pending)
+        else:
+            pending.pending_payload_json = json.dumps(plan.confirm_payload, ensure_ascii=False)
+            pending.pending_question = plan.question
+            pending.expires_at = expires
+            session.add(pending)
+        session.commit()
+        _send_whatsapp_reply(cfg, sender_phone, f"{plan.question}\n\nלהמשך השב: כן / לא")
+        return
+
+    if pending is not None:
+        session.delete(pending)
+        session.commit()
+
+    if plan.status == "needs_disambiguation" and plan.candidates:
+        opts = ", ".join(c.name for c in plan.candidates[:5])
+        _send_whatsapp_reply(cfg, sender_phone, f"{plan.question}\nאפשרויות: {opts}")
+        return
+    _send_whatsapp_reply(cfg, sender_phone, plan.question)
+
+
+def _send_whatsapp_reply(cfg: ShopWhatsappConfig, to_phone: str, text: str) -> None:
+    if not cfg.access_token or not cfg.phone_number_id:
+        return
+    try:
+        send_test_text_message(cfg.access_token, cfg.phone_number_id, to_phone, text[:1900])
+    except Exception:
+        # Don't raise inside webhook path; WhatsApp retries anyway and we avoid 500 loops.
+        return

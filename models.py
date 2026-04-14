@@ -346,3 +346,15 @@ class ShopWhatsappConfig(SQLModel, table=True):
     created_by_user_id: Optional[int] = Field(default=None, foreign_key="user.id")
     updated_by_user_id: Optional[int] = Field(default=None, foreign_key="user.id")
     updated_at: datetime = Field(default_factory=utcnow)
+
+
+class ShopWhatsappPendingAction(SQLModel, table=True):
+    """Pending WhatsApp confirmation per sender within a shop."""
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    shop_id: int = Field(foreign_key="shop.id", index=True)
+    sender_phone: str = Field(index=True, max_length=64)
+    pending_payload_json: str = ""
+    pending_question: str = ""
+    created_at: datetime = Field(default_factory=utcnow, index=True)
+    expires_at: datetime = Field(default_factory=utcnow, index=True)
