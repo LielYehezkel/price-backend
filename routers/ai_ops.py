@@ -1331,7 +1331,7 @@ def whatsapp_wizard(
 ) -> WhatsappWizardOut:
     require_shop_access(session, user, shop_id)
     cfg = session.exec(select(ShopWhatsappConfig).where(ShopWhatsappConfig.shop_id == shop_id)).first()
-    wh, _, _ = _webhook_urls(cfg)
+    wh, _, sales_wh = _webhook_urls(cfg)
     has_cfg = cfg is not None
     has_ids = has_cfg and bool((cfg.phone_number_id or "").strip()) and bool((cfg.verify_token or "").strip())
     has_token = has_cfg and bool((cfg.access_token or "").strip())
