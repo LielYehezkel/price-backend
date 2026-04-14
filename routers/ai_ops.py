@@ -227,11 +227,13 @@ async def plan_chat_action(
             )
             sale_now = parse_price(wc_row.get("sale_price"))
             regular_now = parse_price(wc_row.get("regular_price")) if wc_row else None
+            effective_now = effective_wc_price(wc_row)
+            on_sale_now = bool(wc_row.get("on_sale"))
             price_field = "regular_price"
             from_price_val = regular_now if regular_now is not None else p.regular_price
-            if sale_now is not None and sale_now > 0:
+            if on_sale_now:
                 price_field = "sale_price"
-                from_price_val = sale_now
+                from_price_val = effective_now if effective_now is not None else sale_now
             if from_price_val is None:
                 continue
             to_price_val = max(0.0, float(from_price_val) - float(intent.delta_amount))
@@ -326,11 +328,13 @@ async def plan_chat_action(
         )
         sale_now = parse_price(wc_row.get("sale_price"))
         regular_now = parse_price(wc_row.get("regular_price")) if wc_row else None
+        effective_now = effective_wc_price(wc_row)
+        on_sale_now = bool(wc_row.get("on_sale"))
         price_field = "regular_price"
         from_price_val = regular_now if regular_now is not None else target.regular_price
-        if sale_now is not None and sale_now > 0:
+        if on_sale_now:
             price_field = "sale_price"
-            from_price_val = sale_now
+            from_price_val = effective_now if effective_now is not None else sale_now
         if from_price_val is None:
             return ChatPlanOut(
                 status="cannot_plan",
@@ -378,11 +382,13 @@ async def plan_chat_action(
         )
         sale_now = parse_price(wc_row.get("sale_price"))
         regular_now = parse_price(wc_row.get("regular_price")) if wc_row else None
+        effective_now = effective_wc_price(wc_row)
+        on_sale_now = bool(wc_row.get("on_sale"))
         price_field = "regular_price"
         from_price_val = regular_now if regular_now is not None else target.regular_price
-        if sale_now is not None and sale_now > 0:
+        if on_sale_now:
             price_field = "sale_price"
-            from_price_val = sale_now
+            from_price_val = effective_now if effective_now is not None else sale_now
         if from_price_val is None:
             return ChatPlanOut(
                 status="cannot_plan",
@@ -558,6 +564,12 @@ def confirm_chat_action(
             "sale_price": parse_price(row_before.get("sale_price")),
             "price_field": price_field,
         }
+        on_sale_before = bool(row_before.get("on_sale"))
+        # If Woo reports active sale, updating regular_price won't change visible price.
+        # Force execution path to sale_price to avoid false "executed" responses.
+        if price_field == "regular_price" and on_sale_before:
+            price_field = "sale_price"
+            before["price_field"] = "sale_price"
         if price_field == "sale_price":
             if action == "increase_price":
                 regular_before = before.get("regular_price")
