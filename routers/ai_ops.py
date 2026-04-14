@@ -16,6 +16,7 @@ from backend.deps import get_current_user, require_shop_access
 from backend.models import Product, Shop, ShopAiActionLog, ShopWhatsappConfig, ShopWhatsappPendingAction, User, utcnow
 from backend.services.ai_ops import parse_intent_with_openai, rank_product_candidates
 from backend.services.woo_sync import (
+    effective_wc_price,
     force_wc_product_effective_price,
     force_wc_variation_effective_price,
     fetch_wc_product_by_id,
@@ -613,6 +614,7 @@ def confirm_chat_action(
         after_regular = parse_price(row_after.get("regular_price"))
         after_sale = parse_price(row_after.get("sale_price"))
         observed = after_sale if price_field == "sale_price" else after_regular
+        observed_effective = effective_wc_price(row_after)
         if price_field == "sale_price" and action == "increase_price" and not _price_almost_equal(observed, to_price):
             # Last-resort retry: force regular above target, then retry sale update once.
             retry_regular = float(to_price + 10.0)
@@ -634,6 +636,7 @@ def confirm_chat_action(
             after_regular = parse_price(row_after.get("regular_price"))
             after_sale = parse_price(row_after.get("sale_price"))
             observed = after_sale
+            observed_effective = effective_wc_price(row_after)
         if price_field == "sale_price" and action == "increase_price" and not _price_almost_equal(observed, to_price):
             # Some shops derive displayed parent price from variations only.
             product_type = str(row_after.get("type") or row_before.get("type") or "")
@@ -675,6 +678,7 @@ def confirm_chat_action(
                 after_regular = parse_price(row_after.get("regular_price"))
                 after_sale = parse_price(row_after.get("sale_price"))
                 observed = after_sale
+                observed_effective = effective_wc_price(row_after)
         if price_field == "sale_price" and not _price_almost_equal(observed, to_price):
             # Ultimate fallback: enforce effective displayed price.
             product_type = str(row_after.get("type") or row_before.get("type") or "")
@@ -716,12 +720,14 @@ def confirm_chat_action(
             after_regular = parse_price(row_after.get("regular_price"))
             after_sale = parse_price(row_after.get("sale_price"))
             observed = after_sale if after_sale is not None else after_regular
-        if not _price_almost_equal(observed, to_price):
+            observed_effective = effective_wc_price(row_after)
+        if not _price_almost_equal(observed, to_price) and not _price_almost_equal(observed_effective, to_price):
             raise HTTPException(
                 409,
                 (
                     "העדכון נשלח ל-WooCommerce אבל המחיר בפועל לא השתנה לערך המבוקש. "
                     f"field={price_field} target={to_price:.2f} observed={observed!s} delta={delta_amount:.2f} "
+                    f"observed_effective={observed_effective!s} "
                     f"type={row_after.get('type')!s} on_sale={row_after.get('on_sale')!s}"
                 ),
             )

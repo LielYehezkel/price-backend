@@ -244,7 +244,7 @@ def _migrate_shop_ai_action_log() -> None:
         ),
         (
             "user_id",
-            "ALTER TABLE shopaiactionlog ADD COLUMN user_id INTEGER REFERENCES user(id)",
+            'ALTER TABLE shopaiactionlog ADD COLUMN user_id INTEGER REFERENCES "user"(id)',
         ),
         (
             "action",
@@ -276,7 +276,7 @@ def _migrate_shop_ai_action_log() -> None:
         ),
         (
             "undone_by_user_id",
-            "ALTER TABLE shopaiactionlog ADD COLUMN undone_by_user_id INTEGER REFERENCES user(id)",
+            'ALTER TABLE shopaiactionlog ADD COLUMN undone_by_user_id INTEGER REFERENCES "user"(id)',
         ),
         (
             "undo_note",
@@ -308,11 +308,11 @@ def _migrate_shop_whatsapp_config() -> None:
         ("webhook_path_secret", "ALTER TABLE shopwhatsappconfig ADD COLUMN webhook_path_secret VARCHAR"),
         (
             "created_by_user_id",
-            "ALTER TABLE shopwhatsappconfig ADD COLUMN created_by_user_id INTEGER REFERENCES user(id)",
+            'ALTER TABLE shopwhatsappconfig ADD COLUMN created_by_user_id INTEGER REFERENCES "user"(id)',
         ),
         (
             "updated_by_user_id",
-            "ALTER TABLE shopwhatsappconfig ADD COLUMN updated_by_user_id INTEGER REFERENCES user(id)",
+            'ALTER TABLE shopwhatsappconfig ADD COLUMN updated_by_user_id INTEGER REFERENCES "user"(id)',
         ),
         ("updated_at", "ALTER TABLE shopwhatsappconfig ADD COLUMN updated_at TIMESTAMP"),
     ]
