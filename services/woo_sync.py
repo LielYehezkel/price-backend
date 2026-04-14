@@ -13,7 +13,11 @@ def fetch_wc_products(site_url: str, consumer_key: str, consumer_secret: str) ->
     page = 1
     with httpx.Client(timeout=40.0, follow_redirects=True) as client:
         while True:
-            r = client.get(url, params={**params, "page": page})
+            r = client.get(
+                url,
+                params={**params, "page": page, "_ts": int(time.time() * 1000)},
+                headers={"Cache-Control": "no-cache", "Pragma": "no-cache"},
+            )
             r.raise_for_status()
             batch = r.json()
             if not batch:
@@ -51,8 +55,9 @@ def fetch_wc_products_by_ids(
                 "consumer_secret": consumer_secret,
                 "include": ",".join(str(x) for x in chunk),
                 "per_page": 100,
+                "_ts": int(time.time() * 1000),
             }
-            r = client.get(url, params=params)
+            r = client.get(url, params=params, headers={"Cache-Control": "no-cache", "Pragma": "no-cache"})
             r.raise_for_status()
             batch = r.json()
             if not isinstance(batch, list):
@@ -74,9 +79,13 @@ def fetch_wc_product_by_id(
 ) -> dict[str, Any]:
     base = site_url.rstrip("/")
     url = f"{base}/wp-json/wc/v3/products/{int(woo_product_id)}"
-    params = {"consumer_key": consumer_key, "consumer_secret": consumer_secret}
+    params = {
+        "consumer_key": consumer_key,
+        "consumer_secret": consumer_secret,
+        "_ts": int(time.time() * 1000),
+    }
     with httpx.Client(timeout=25.0, follow_redirects=True) as client:
-        r = client.get(url, params=params)
+        r = client.get(url, params=params, headers={"Cache-Control": "no-cache", "Pragma": "no-cache"})
         r.raise_for_status()
         data = r.json()
     return data if isinstance(data, dict) else {}
@@ -353,7 +362,11 @@ def fetch_wc_product_variations(
     page = 1
     with httpx.Client(timeout=40.0, follow_redirects=True) as client:
         while True:
-            r = client.get(url, params={**params, "page": page})
+            r = client.get(
+                url,
+                params={**params, "page": page, "_ts": int(time.time() * 1000)},
+                headers={"Cache-Control": "no-cache", "Pragma": "no-cache"},
+            )
             r.raise_for_status()
             batch = r.json()
             if not isinstance(batch, list) or not batch:
@@ -400,8 +413,8 @@ def fetch_wc_product_with_retries(
     consumer_secret: str,
     woo_product_id: int,
     *,
-    retries: int = 3,
-    delay_seconds: float = 0.45,
+    retries: int = 8,
+    delay_seconds: float = 0.8,
 ) -> dict[str, Any]:
     last: dict[str, Any] = {}
     for idx in range(max(1, retries)):

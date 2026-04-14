@@ -716,8 +716,8 @@ def confirm_chat_action(
                 shop.woo_consumer_key,
                 shop.woo_consumer_secret,
                 int(p.woo_product_id),
-                retries=4,
-                delay_seconds=0.6,
+                retries=10,
+                delay_seconds=1.0,
             )
             after_regular = parse_price(row_after.get("regular_price"))
             after_sale = parse_price(row_after.get("sale_price"))
@@ -758,8 +758,8 @@ def confirm_chat_action(
                 shop.woo_consumer_key,
                 shop.woo_consumer_secret,
                 int(p.woo_product_id),
-                retries=4,
-                delay_seconds=0.6,
+                retries=10,
+                delay_seconds=1.0,
             )
             after_regular = parse_price(row_after.get("regular_price"))
             after_sale = parse_price(row_after.get("sale_price"))
