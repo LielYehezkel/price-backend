@@ -54,10 +54,20 @@ _REDUCE_KEYWORDS = (
     "להפחית",
 )
 
+_INCREASE_KEYWORDS = (
+    "תעלה את המחיר",
+    "תעלה מחיר",
+    "להעלות מחיר",
+    "תייקר",
+    "לייקר",
+    "תוסיף למחיר",
+    "להוסיף למחיר",
+)
+
 
 @dataclass
 class ParsedIntent:
-    action: str  # reduce_price | out_of_stock | in_stock | bulk_reduce_price | unknown
+    action: str  # reduce_price | increase_price | out_of_stock | in_stock | bulk_reduce_price | unknown
     product_query: str
     delta_amount: float | None = None
     currency_hint: str | None = None
@@ -101,6 +111,8 @@ def parse_intent_rule_based(message: str) -> ParsedIntent:
     has_reduce_words = any(k in txt for k in ("תוריד", "להוריד", "הוצא"))
     if action == "unknown" and has_stock_words and has_reduce_words:
         action = "out_of_stock"
+    if action == "unknown" and any(k in txt for k in _INCREASE_KEYWORDS):
+        action = "increase_price"
     if action == "unknown" and any(k in txt for k in _REDUCE_KEYWORDS):
         action = "reduce_price"
     if action == "reduce_price" and any(k in txt for k in ("כל ", "קטגור", "רשימה", "כמה מוצרים", "מוצרים:")):
@@ -108,7 +120,7 @@ def parse_intent_rule_based(message: str) -> ParsedIntent:
 
     delta: float | None = None
     nums = re.findall(r"[-+]?\d+(?:[.,]\d+)?", txt)
-    if action in ("reduce_price", "bulk_reduce_price") and nums:
+    if action in ("reduce_price", "increase_price", "bulk_reduce_price") and nums:
         try:
             # Usually the last number in Hebrew command is the requested delta.
             delta = abs(float(nums[-1].replace(",", ".")))
@@ -118,7 +130,7 @@ def parse_intent_rule_based(message: str) -> ParsedIntent:
     product_query = txt
     # Remove obvious command words to leave a cleaner query.
     product_query = re.sub(
-        r"\b(תוריד|להוריד|תחזיר|להחזיר|החזר|שים|מחיר|מהמלאי|במלאי|מלאי|של|את|ב|שח|₪|nis|ils)\b",
+        r"\b(תוריד|להוריד|תעלה|להעלות|תייקר|לייקר|תחזיר|להחזיר|החזר|שים|מחיר|מהמלאי|במלאי|מלאי|של|את|ב|שח|₪|nis|ils)\b",
         " ",
         product_query,
     )
@@ -129,7 +141,7 @@ def parse_intent_rule_based(message: str) -> ParsedIntent:
     conf = 0.4
     if action != "unknown":
         conf = 0.7
-    if action == "reduce_price" and delta is not None:
+    if action in ("reduce_price", "increase_price") and delta is not None:
         conf = 0.8
     bulk_scope: str | None = None
     target_category: str | None = None
@@ -168,14 +180,14 @@ async def parse_intent_with_openai(message: str) -> ParsedIntent:
     sys = (
         "You parse Hebrew ecommerce admin commands into strict JSON."
         " Return only action/product_query/delta_amount/currency_hint/confidence."
-        " action must be one of: reduce_price,out_of_stock,in_stock,bulk_reduce_price,unknown."
+        " action must be one of: reduce_price,increase_price,out_of_stock,in_stock,bulk_reduce_price,unknown."
     )
     schema = {
         "type": "object",
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["reduce_price", "out_of_stock", "in_stock", "bulk_reduce_price", "unknown"],
+                "enum": ["reduce_price", "increase_price", "out_of_stock", "in_stock", "bulk_reduce_price", "unknown"],
             },
             "product_query": {"type": "string"},
             "delta_amount": {"type": ["number", "null"]},

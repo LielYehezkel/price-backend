@@ -50,7 +50,7 @@ class ChatCandidateOut(BaseModel):
 
 class ChatPlanOut(BaseModel):
     status: Literal["needs_confirmation", "needs_disambiguation", "cannot_plan"]
-    action: Literal["reduce_price", "out_of_stock", "in_stock", "bulk_reduce_price", "unknown"]
+    action: Literal["reduce_price", "increase_price", "out_of_stock", "in_stock", "bulk_reduce_price", "unknown"]
     question: str
     product_id: int | None = None
     product_name: str | None = None
@@ -89,6 +89,10 @@ def _ensure_woo_connected(shop) -> None:
 
 def _build_confirmation_for_price(name: str, old_price: float, new_price: float) -> str:
     return f'האם להוריד את המחיר של "{name}" מ{old_price:,.2f} ש"ח ל{new_price:,.2f} ש"ח?'
+
+
+def _build_confirmation_for_price_increase(name: str, old_price: float, new_price: float) -> str:
+    return f'האם להעלות את המחיר של "{name}" מ{old_price:,.2f} ש"ח ל{new_price:,.2f} ש"ח?'
 
 
 def _build_confirmation_for_stock(name: str) -> str:
@@ -143,7 +147,7 @@ async def plan_chat_action(
         raise HTTPException(400, "הודעה חסרה")
 
     intent = await parse_intent_with_openai(msg)
-    if intent.action not in ("reduce_price", "out_of_stock", "in_stock", "bulk_reduce_price"):
+    if intent.action not in ("reduce_price", "increase_price", "out_of_stock", "in_stock", "bulk_reduce_price"):
         return ChatPlanOut(status="cannot_plan", action="unknown", question="לא זיהיתי פעולה נתמכת בהודעה.")
 
     products = session.exec(select(Product).where(Product.shop_id == shop.id)).all()
@@ -333,6 +337,58 @@ async def plan_chat_action(
             },
         )
 
+    if intent.action == "increase_price":
+        if intent.delta_amount is None or intent.delta_amount <= 0:
+            return ChatPlanOut(
+                status="cannot_plan",
+                action="increase_price",
+                question='לא זיהיתי בכמה להעלות את המחיר. נסה לכתוב למשל: "ב-50 ש"ח".',
+            )
+        if not target.woo_product_id:
+            return ChatPlanOut(
+                status="cannot_plan",
+                action="increase_price",
+                question=f'למוצר "{target.name}" אין מזהה WooCommerce תקין.',
+            )
+        wc_row = fetch_wc_product_by_id(
+            shop.woo_site_url,
+            shop.woo_consumer_key,
+            shop.woo_consumer_secret,
+            int(target.woo_product_id),
+        )
+        sale_now = parse_price(wc_row.get("sale_price"))
+        regular_now = parse_price(wc_row.get("regular_price")) if wc_row else None
+        price_field = "regular_price"
+        from_price_val = regular_now if regular_now is not None else target.regular_price
+        if sale_now is not None and sale_now > 0:
+            price_field = "sale_price"
+            from_price_val = sale_now
+        if from_price_val is None:
+            return ChatPlanOut(
+                status="cannot_plan",
+                action="increase_price",
+                question=f'למוצר "{target.name}" אין מחיר נוכחי במערכת.',
+            )
+        new_price = max(0.0, float(from_price_val) + float(intent.delta_amount))
+        return ChatPlanOut(
+            status="needs_confirmation",
+            action="increase_price",
+            question=_build_confirmation_for_price_increase(target.name, float(from_price_val), new_price),
+            product_id=target.id,
+            product_name=target.name,
+            delta_amount=float(intent.delta_amount),
+            from_price=float(from_price_val),
+            to_price=float(new_price),
+            currency=shop.woo_currency or "ILS",
+            confirm_payload={
+                "action": "increase_price",
+                "product_id": target.id,
+                "delta_amount": float(intent.delta_amount),
+                "to_price": float(new_price),
+                "price_field": price_field,
+            },
+        )
+
     if intent.action == "in_stock":
         return ChatPlanOut(
             status="needs_confirmation",
@@ -462,7 +518,7 @@ def confirm_chat_action(
     if not p.woo_product_id:
         raise HTTPException(400, "למוצר אין מזהה WooCommerce ולכן אי אפשר לבצע פעולה זו.")
 
-    if action == "reduce_price":
+    if action in ("reduce_price", "increase_price"):
         to_price_raw = payload.get("to_price")
         try:
             to_price = float(to_price_raw)
@@ -509,7 +565,7 @@ def confirm_chat_action(
             session,
             shop_id=shop_id,
             user_id=user.id or 0,
-            action="reduce_price",
+            action=action,
             product_id=p.id,
             payload={
                 "price_field": price_field,
@@ -524,7 +580,7 @@ def confirm_chat_action(
         )
         return ChatConfirmOut(
             status="executed",
-            action="reduce_price",
+            action=action,
             product_id=p.id,
             product_name=p.name,
             before=before,
@@ -689,7 +745,7 @@ def undo_ai_action(
     except Exception:
         payload = {}
     try:
-        if row.action == "reduce_price":
+        if row.action in ("reduce_price", "increase_price"):
             woo_id = int(payload.get("woo_product_id"))
             price_field = str(payload.get("price_field") or "regular_price")
             before = payload.get("before") or {}
