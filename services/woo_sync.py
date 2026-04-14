@@ -299,6 +299,38 @@ def force_wc_product_effective_price_via_meta(
         r.raise_for_status()
 
 
+def force_wc_product_sale_price_via_meta(
+    site_url: str,
+    consumer_key: str,
+    consumer_secret: str,
+    woo_product_id: int,
+    target_sale_price: float,
+    regular_price_hint: float | None = None,
+) -> None:
+    """
+    Plugin-resistant fallback for sale updates.
+    Keeps sale mode (does NOT clear sale_price).
+    """
+    base = site_url.rstrip("/")
+    url = f"{base}/wp-json/wc/v3/products/{woo_product_id}"
+    params = _wc_auth_params(consumer_key, consumer_secret)
+    body: dict[str, Any] = {
+        "sale_price": f"{target_sale_price:.2f}",
+        "date_on_sale_from": None,
+        "date_on_sale_to": None,
+        "meta_data": [
+            {"key": "_sale_price", "value": f"{target_sale_price:.2f}"},
+            {"key": "_price", "value": f"{target_sale_price:.2f}"},
+        ],
+    }
+    if regular_price_hint is not None:
+        body["regular_price"] = f"{regular_price_hint:.2f}"
+        body["meta_data"].append({"key": "_regular_price", "value": f"{regular_price_hint:.2f}"})
+    with httpx.Client(timeout=30.0, follow_redirects=True) as client:
+        r = client.put(url, params=params, json=body)
+        r.raise_for_status()
+
+
 def force_wc_variation_effective_price(
     site_url: str,
     consumer_key: str,
@@ -316,6 +348,35 @@ def force_wc_variation_effective_price(
         "date_on_sale_from": None,
         "date_on_sale_to": None,
     }
+    with httpx.Client(timeout=30.0, follow_redirects=True) as client:
+        r = client.put(url, params=params, json=body)
+        r.raise_for_status()
+
+
+def force_wc_variation_sale_price_via_meta(
+    site_url: str,
+    consumer_key: str,
+    consumer_secret: str,
+    woo_product_id: int,
+    variation_id: int,
+    target_sale_price: float,
+    regular_price_hint: float | None = None,
+) -> None:
+    base = site_url.rstrip("/")
+    url = f"{base}/wp-json/wc/v3/products/{woo_product_id}/variations/{variation_id}"
+    params = _wc_auth_params(consumer_key, consumer_secret)
+    body: dict[str, Any] = {
+        "sale_price": f"{target_sale_price:.2f}",
+        "date_on_sale_from": None,
+        "date_on_sale_to": None,
+        "meta_data": [
+            {"key": "_sale_price", "value": f"{target_sale_price:.2f}"},
+            {"key": "_price", "value": f"{target_sale_price:.2f}"},
+        ],
+    }
+    if regular_price_hint is not None:
+        body["regular_price"] = f"{regular_price_hint:.2f}"
+        body["meta_data"].append({"key": "_regular_price", "value": f"{regular_price_hint:.2f}"})
     with httpx.Client(timeout=30.0, follow_redirects=True) as client:
         r = client.put(url, params=params, json=body)
         r.raise_for_status()
