@@ -260,6 +260,36 @@ def force_wc_product_effective_price(
         r.raise_for_status()
 
 
+def force_wc_product_effective_price_via_meta(
+    site_url: str,
+    consumer_key: str,
+    consumer_secret: str,
+    woo_product_id: int,
+    target_price: float,
+) -> None:
+    """
+    Aggressive fallback for stores/plugins that override regular sale payloads.
+    Also writes core Woo meta keys directly.
+    """
+    base = site_url.rstrip("/")
+    url = f"{base}/wp-json/wc/v3/products/{woo_product_id}"
+    params = _wc_auth_params(consumer_key, consumer_secret)
+    body = {
+        "regular_price": f"{target_price:.2f}",
+        "sale_price": "",
+        "date_on_sale_from": None,
+        "date_on_sale_to": None,
+        "meta_data": [
+            {"key": "_regular_price", "value": f"{target_price:.2f}"},
+            {"key": "_sale_price", "value": ""},
+            {"key": "_price", "value": f"{target_price:.2f}"},
+        ],
+    }
+    with httpx.Client(timeout=30.0, follow_redirects=True) as client:
+        r = client.put(url, params=params, json=body)
+        r.raise_for_status()
+
+
 def force_wc_variation_effective_price(
     site_url: str,
     consumer_key: str,
@@ -276,6 +306,33 @@ def force_wc_variation_effective_price(
         "sale_price": "",
         "date_on_sale_from": None,
         "date_on_sale_to": None,
+    }
+    with httpx.Client(timeout=30.0, follow_redirects=True) as client:
+        r = client.put(url, params=params, json=body)
+        r.raise_for_status()
+
+
+def force_wc_variation_effective_price_via_meta(
+    site_url: str,
+    consumer_key: str,
+    consumer_secret: str,
+    woo_product_id: int,
+    variation_id: int,
+    target_price: float,
+) -> None:
+    base = site_url.rstrip("/")
+    url = f"{base}/wp-json/wc/v3/products/{woo_product_id}/variations/{variation_id}"
+    params = _wc_auth_params(consumer_key, consumer_secret)
+    body = {
+        "regular_price": f"{target_price:.2f}",
+        "sale_price": "",
+        "date_on_sale_from": None,
+        "date_on_sale_to": None,
+        "meta_data": [
+            {"key": "_regular_price", "value": f"{target_price:.2f}"},
+            {"key": "_sale_price", "value": ""},
+            {"key": "_price", "value": f"{target_price:.2f}"},
+        ],
     }
     with httpx.Client(timeout=30.0, follow_redirects=True) as client:
         r = client.put(url, params=params, json=body)

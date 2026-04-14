@@ -18,7 +18,9 @@ from backend.services.ai_ops import parse_intent_with_openai, rank_product_candi
 from backend.services.woo_sync import (
     effective_wc_price,
     force_wc_product_effective_price,
+    force_wc_product_effective_price_via_meta,
     force_wc_variation_effective_price,
+    force_wc_variation_effective_price_via_meta,
     fetch_wc_product_by_id,
     fetch_wc_product_variations,
     fetch_wc_product_with_retries,
@@ -703,6 +705,48 @@ def confirm_chat_action(
                     )
             else:
                 force_wc_product_effective_price(
+                    shop.woo_site_url,
+                    shop.woo_consumer_key,
+                    shop.woo_consumer_secret,
+                    int(p.woo_product_id),
+                    float(to_price),
+                )
+            row_after = fetch_wc_product_with_retries(
+                shop.woo_site_url,
+                shop.woo_consumer_key,
+                shop.woo_consumer_secret,
+                int(p.woo_product_id),
+                retries=4,
+                delay_seconds=0.6,
+            )
+            after_regular = parse_price(row_after.get("regular_price"))
+            after_sale = parse_price(row_after.get("sale_price"))
+            observed = after_sale if after_sale is not None else after_regular
+            observed_effective = effective_wc_price(row_after)
+        if price_field == "sale_price" and not _price_almost_equal(observed, to_price) and not _price_almost_equal(observed_effective, to_price):
+            # Plugin-resistant fallback: write core Woo price meta keys too.
+            product_type = str(row_after.get("type") or row_before.get("type") or "")
+            if product_type == "variable":
+                vars_rows = fetch_wc_product_variations(
+                    shop.woo_site_url,
+                    shop.woo_consumer_key,
+                    shop.woo_consumer_secret,
+                    int(p.woo_product_id),
+                )
+                for v in vars_rows:
+                    vid = v.get("id")
+                    if vid is None:
+                        continue
+                    force_wc_variation_effective_price_via_meta(
+                        shop.woo_site_url,
+                        shop.woo_consumer_key,
+                        shop.woo_consumer_secret,
+                        int(p.woo_product_id),
+                        int(vid),
+                        float(to_price),
+                    )
+            else:
+                force_wc_product_effective_price_via_meta(
                     shop.woo_site_url,
                     shop.woo_consumer_key,
                     shop.woo_consumer_secret,
