@@ -1,4 +1,5 @@
 import re
+import time
 from typing import Any
 
 import httpx
@@ -231,6 +232,78 @@ def patch_wc_product_prices(
     with httpx.Client(timeout=30.0, follow_redirects=True) as client:
         r = client.put(url, params=params, json=body)
         r.raise_for_status()
+
+
+def fetch_wc_product_variations(
+    site_url: str,
+    consumer_key: str,
+    consumer_secret: str,
+    woo_product_id: int,
+) -> list[dict[str, Any]]:
+    base = site_url.rstrip("/")
+    url = f"{base}/wp-json/wc/v3/products/{woo_product_id}/variations"
+    params = _wc_auth_params(consumer_key, consumer_secret)
+    params["per_page"] = 100
+    out: list[dict[str, Any]] = []
+    page = 1
+    with httpx.Client(timeout=40.0, follow_redirects=True) as client:
+        while True:
+            r = client.get(url, params={**params, "page": page})
+            r.raise_for_status()
+            batch = r.json()
+            if not isinstance(batch, list) or not batch:
+                break
+            out.extend([x for x in batch if isinstance(x, dict)])
+            if len(batch) < 100 or page >= 20:
+                break
+            page += 1
+    return out
+
+
+def patch_wc_variation_prices(
+    site_url: str,
+    consumer_key: str,
+    consumer_secret: str,
+    woo_product_id: int,
+    variation_id: int,
+    *,
+    regular_price: float | None = None,
+    sale_price: float | None = None,
+    clear_sale_schedule: bool = False,
+) -> None:
+    base = site_url.rstrip("/")
+    url = f"{base}/wp-json/wc/v3/products/{woo_product_id}/variations/{variation_id}"
+    params = _wc_auth_params(consumer_key, consumer_secret)
+    body: dict[str, Any] = {}
+    if regular_price is not None:
+        body["regular_price"] = f"{regular_price:.2f}"
+    if sale_price is not None:
+        body["sale_price"] = f"{sale_price:.2f}"
+    if clear_sale_schedule:
+        body["date_on_sale_from"] = None
+        body["date_on_sale_to"] = None
+    if not body:
+        return
+    with httpx.Client(timeout=30.0, follow_redirects=True) as client:
+        r = client.put(url, params=params, json=body)
+        r.raise_for_status()
+
+
+def fetch_wc_product_with_retries(
+    site_url: str,
+    consumer_key: str,
+    consumer_secret: str,
+    woo_product_id: int,
+    *,
+    retries: int = 3,
+    delay_seconds: float = 0.45,
+) -> dict[str, Any]:
+    last: dict[str, Any] = {}
+    for idx in range(max(1, retries)):
+        last = fetch_wc_product_by_id(site_url, consumer_key, consumer_secret, woo_product_id)
+        if idx < retries - 1:
+            time.sleep(delay_seconds)
+    return last
 
 
 def patch_wc_product_out_of_stock(

@@ -17,12 +17,15 @@ from backend.models import Product, Shop, ShopAiActionLog, ShopWhatsappConfig, S
 from backend.services.ai_ops import parse_intent_with_openai, rank_product_candidates
 from backend.services.woo_sync import (
     fetch_wc_product_by_id,
+    fetch_wc_product_variations,
+    fetch_wc_product_with_retries,
     parse_price,
     patch_wc_product_in_stock,
     patch_wc_product_out_of_stock,
     patch_wc_product_prices,
     patch_wc_product_regular_price,
     patch_wc_product_sale_price,
+    patch_wc_variation_prices,
 )
 from backend.services.whatsapp_cloud import (
     MetaAuthError,
@@ -599,7 +602,7 @@ def confirm_chat_action(
             p.regular_price = to_price
             session.add(p)
         session.commit()
-        row_after = fetch_wc_product_by_id(
+        row_after = fetch_wc_product_with_retries(
             shop.woo_site_url,
             shop.woo_consumer_key,
             shop.woo_consumer_secret,
@@ -620,7 +623,7 @@ def confirm_chat_action(
                 sale_price=to_price,
                 clear_sale_schedule=True,
             )
-            row_after = fetch_wc_product_by_id(
+            row_after = fetch_wc_product_with_retries(
                 shop.woo_site_url,
                 shop.woo_consumer_key,
                 shop.woo_consumer_secret,
@@ -629,12 +632,54 @@ def confirm_chat_action(
             after_regular = parse_price(row_after.get("regular_price"))
             after_sale = parse_price(row_after.get("sale_price"))
             observed = after_sale
+        if price_field == "sale_price" and action == "increase_price" and not _price_almost_equal(observed, to_price):
+            # Some shops derive displayed parent price from variations only.
+            product_type = str(row_after.get("type") or row_before.get("type") or "")
+            if product_type == "variable":
+                vars_rows = fetch_wc_product_variations(
+                    shop.woo_site_url,
+                    shop.woo_consumer_key,
+                    shop.woo_consumer_secret,
+                    int(p.woo_product_id),
+                )
+                for v in vars_rows:
+                    vid = v.get("id")
+                    if vid is None:
+                        continue
+                    v_regular = parse_price(v.get("regular_price"))
+                    v_sale = parse_price(v.get("sale_price"))
+                    spread = 10.0
+                    if v_regular is not None and v_sale is not None:
+                        spread = max(float(v_regular) - float(v_sale), 10.0)
+                    target_regular = float(to_price + spread)
+                    patch_wc_variation_prices(
+                        shop.woo_site_url,
+                        shop.woo_consumer_key,
+                        shop.woo_consumer_secret,
+                        int(p.woo_product_id),
+                        int(vid),
+                        regular_price=target_regular,
+                        sale_price=to_price,
+                        clear_sale_schedule=True,
+                    )
+                row_after = fetch_wc_product_with_retries(
+                    shop.woo_site_url,
+                    shop.woo_consumer_key,
+                    shop.woo_consumer_secret,
+                    int(p.woo_product_id),
+                    retries=4,
+                    delay_seconds=0.6,
+                )
+                after_regular = parse_price(row_after.get("regular_price"))
+                after_sale = parse_price(row_after.get("sale_price"))
+                observed = after_sale
         if not _price_almost_equal(observed, to_price):
             raise HTTPException(
                 409,
                 (
                     "העדכון נשלח ל-WooCommerce אבל המחיר בפועל לא השתנה לערך המבוקש. "
-                    f"field={price_field} target={to_price:.2f} observed={observed!s} delta={delta_amount:.2f}"
+                    f"field={price_field} target={to_price:.2f} observed={observed!s} delta={delta_amount:.2f} "
+                    f"type={row_after.get('type')!s} on_sale={row_after.get('on_sale')!s}"
                 ),
             )
         log_row = _log_ai_action(
