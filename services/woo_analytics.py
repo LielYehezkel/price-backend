@@ -13,6 +13,7 @@ import httpx
 from sqlmodel import Session, select
 
 from backend.models import Product, SalesInsightsCache, Shop, utcnow
+from backend.services.store_connector import store_platform
 
 log = logging.getLogger(__name__)
 
@@ -59,6 +60,251 @@ def _line_woo_id(line: dict[str, Any]) -> int | None:
     return None
 
 
+def _line_shopify_revenue(li: dict[str, Any]) -> float:
+    try:
+        qty = float(li.get("quantity") or 0)
+    except (TypeError, ValueError):
+        qty = 0.0
+    try:
+        unit = float(li.get("price") or 0)
+    except (TypeError, ValueError):
+        unit = 0.0
+    try:
+        disc = float(li.get("total_discount") or 0)
+    except (TypeError, ValueError):
+        disc = 0.0
+    return max(0.0, unit * qty - disc)
+
+
+def _compute_sales_insights_shopify(session: Session, shop: Shop, shop_id: int, days: int) -> dict[str, Any]:
+    from backend.services import shopify_sync
+
+    if not getattr(shop, "shopify_shop_domain", None) or not getattr(shop, "shopify_admin_access_token", None):
+        return {
+            "ok": False,
+            "error": "shopify_not_configured",
+            "message_he": "חברו את Shopify בהגדרות החנות כדי לראות נתוני מכירות אמיתיים.",
+        }
+
+    days = max(7, min(days, 365))
+    after_iso = _utc_cutoff_iso(days)
+
+    products = session.exec(select(Product).where(Product.shop_id == shop_id)).all()
+    by_variant: dict[int, Product] = {}
+    by_product: dict[int, list[Product]] = defaultdict(list)
+    for p in products:
+        if p.shopify_variant_id is not None:
+            by_variant[int(p.shopify_variant_id)] = p
+        if p.shopify_product_id is not None:
+            by_product[int(p.shopify_product_id)].append(p)
+
+    if not by_variant and not by_product:
+        return {
+            "ok": True,
+            "woo_connected": True,
+            "shopify_connected": True,
+            "period_days": days,
+            "currency": shop.woo_currency or "",
+            "orders_fetched": 0,
+            "orders_with_tracked_lines": 0,
+            "tracked_line_items": 0,
+            "total_revenue_tracked": 0.0,
+            "total_units_tracked": 0.0,
+            "auto_pricing_revenue": 0.0,
+            "auto_pricing_units": 0.0,
+            "top_products": [],
+            "price_bands": [],
+            "period_split": None,
+            "methodology_he": "אין מוצרים עם מזהה Shopify אחרי סנכרון — סנכרנו מוצרים ונסו שוב.",
+        }
+
+    def _resolve_line_product(li: dict[str, Any]) -> Product | None:
+        vid = li.get("variant_id")
+        if vid is not None:
+            try:
+                return by_variant.get(int(vid))
+            except (TypeError, ValueError):
+                pass
+        pid = li.get("product_id")
+        if pid is not None:
+            try:
+                lst = by_product.get(int(pid))
+                if lst:
+                    return lst[0]
+            except (TypeError, ValueError):
+                pass
+        return None
+
+    try:
+        all_orders = shopify_sync.list_orders_since(shop, created_at_min_iso=after_iso)
+    except httpx.HTTPStatusError as ex:
+        return {
+            "ok": False,
+            "error": "shopify_http_error",
+            "message_he": (
+                "קריאת הזמנות מ-Shopify נכשלה. בדקו הרשאות read_orders ודומיין. "
+                f"פרטי שגיאה: {ex!s}"
+            ),
+        }
+    except httpx.HTTPError as ex:
+        return {
+            "ok": False,
+            "error": "shopify_network_error",
+            "message_he": f"לא ניתן להתחבר ל-Shopify כרגע. פרטי שגיאה: {ex!s}",
+        }
+    except Exception as ex:
+        return {
+            "ok": False,
+            "error": "shopify_error",
+            "message_he": f"שגיאה בטעינת הזמנות מ-Shopify: {ex!s}",
+        }
+
+    by_product_rev: dict[int, float] = defaultdict(float)
+    by_product_units: dict[int, float] = defaultdict(float)
+    by_product_name: dict[int, str] = {}
+    auto_pricing_rev = 0.0
+    auto_pricing_units = 0.0
+    hist_weighted: list[tuple[float, float]] = []
+
+    mid = datetime.now(timezone.utc) - timedelta(days=days / 2)
+    first_half_rev = 0.0
+    second_half_rev = 0.0
+    tracked_orders = 0
+
+    for order in all_orders:
+        if not isinstance(order, dict):
+            continue
+        fin = str(order.get("financial_status") or "")
+        if fin not in ("paid", "partially_paid", "authorized", "partially_refunded"):
+            continue
+        dt_s = order.get("created_at") or order.get("processed_at")
+        od: datetime | None = None
+        if isinstance(dt_s, str):
+            try:
+                od = datetime.fromisoformat(dt_s.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+        else:
+            continue
+
+        order_tracked = False
+        for line in order.get("line_items") or []:
+            if not isinstance(line, dict):
+                continue
+            p = _resolve_line_product(line)
+            if p is None:
+                continue
+            qty = float(line.get("quantity") or 0)
+            total = _line_shopify_revenue(line)
+            if qty <= 0 or total <= 0:
+                continue
+            unit = total / qty
+            order_tracked = True
+            pid = int(p.id or 0)
+            by_product_rev[pid] += total
+            by_product_units[pid] += qty
+            by_product_name[pid] = p.name or f"#{p.id}"
+            hist_weighted.append((unit, total))
+            if p.auto_pricing_enabled:
+                auto_pricing_rev += total
+                auto_pricing_units += qty
+            if od >= mid:
+                second_half_rev += total
+            else:
+                first_half_rev += total
+
+        if order_tracked:
+            tracked_orders += 1
+
+    total_rev = sum(by_product_rev.values())
+    total_units = sum(by_product_units.values())
+
+    top = sorted(by_product_rev.items(), key=lambda x: -x[1])[:15]
+    top_products = [
+        {
+            "product_id": pid,
+            "name": by_product_name.get(pid, str(pid)),
+            "revenue": round(r, 2),
+            "units": round(by_product_units[pid], 2),
+        }
+        for pid, r in top
+    ]
+
+    cur_code = shop.woo_currency or ""
+    price_bands: list[dict[str, Any]] = []
+    if hist_weighted:
+        units_only = sorted(u for u, _ in hist_weighted)
+        lo, hi = units_only[0], units_only[-1]
+        if hi - lo < 1e-6:
+            tot_r = sum(t for _, t in hist_weighted)
+            tot_u = sum(t / u for u, t in hist_weighted if u > 0)
+            price_bands.append(
+                {
+                    "label": f"{lo:.2f} {cur_code}".strip(),
+                    "revenue": round(tot_r, 2),
+                    "units": round(tot_u, 2),
+                },
+            )
+        else:
+            n_bins = min(8, max(3, len(units_only) // 4))
+            step = (hi - lo) / n_bins
+            for i in range(n_bins):
+                b_lo = lo + i * step
+                b_hi = lo + (i + 1) * step if i < n_bins - 1 else hi + 1e-6
+                rev_b = 0.0
+                u_b = 0.0
+                for unit, tot in hist_weighted:
+                    if b_lo <= unit < b_hi or (i == n_bins - 1 and b_lo <= unit <= hi):
+                        rev_b += tot
+                        u_b += tot / unit if unit > 0 else 0
+                if rev_b > 0:
+                    price_bands.append(
+                        {
+                            "label": _bucket_label(b_lo, b_hi, cur_code, i == n_bins - 1),
+                            "revenue": round(rev_b, 2),
+                            "units": round(u_b, 2),
+                        },
+                    )
+
+    methodology = (
+        "הדוח מבוסס על הזמנות מ-Shopify (financial_status בתשלום/חלקי) בתוך חלון הימים שנבחר. "
+        "נספרות רק שורות שמותאמות למוצרים שמסונכרנים אצלנו (מזהה variant_id או product_id — מדיניות MVP). "
+        "הכנסה לשורה = מחיר יחידה כפול כמות פחות total_discount בשורה. "
+        "״הכנסות תחת תמחור אוטומטי״ = מוצרים עם תמחור אוטומטי פעיל בזמן הצגת הדוח."
+    )
+
+    trend_note = ""
+    if first_half_rev + second_half_rev > 1 and first_half_rev > 0:
+        ch = (second_half_rev - first_half_rev) / first_half_rev * 100
+        trend_note = (
+            f"חציון זמן: בהשוואה גסה בין חצי התקופה הראשון לשני (לפי תאריך הזמנה), "
+            f"ההכנסות מהשורות שעוקבות השתנו בכ־{ch:+.1f}%."
+        )
+
+    return {
+        "ok": True,
+        "woo_connected": True,
+        "shopify_connected": True,
+        "period_days": days,
+        "currency": cur_code,
+        "orders_fetched": len(all_orders),
+        "orders_with_tracked_lines": tracked_orders,
+        "tracked_line_items": len(hist_weighted),
+        "total_revenue_tracked": round(total_rev, 2),
+        "total_units_tracked": round(total_units, 2),
+        "auto_pricing_revenue": round(auto_pricing_rev, 2),
+        "auto_pricing_units": round(auto_pricing_units, 2),
+        "top_products": top_products,
+        "price_bands": price_bands,
+        "period_split": {
+            "first_half_revenue": round(first_half_rev, 2),
+            "second_half_revenue": round(second_half_rev, 2),
+            "comparison_note": trend_note or None,
+        },
+        "methodology_he": methodology,
+    }
+
+
 def _bucket_label(low: float, high: float, currency: str, last: bool) -> str:
     cur = (currency or "").strip()
     suf = f" {cur}" if cur else ""
@@ -71,6 +317,8 @@ def compute_sales_insights(session: Session, shop_id: int, days: int = 90) -> di
     shop = session.get(Shop, shop_id)
     if not shop:
         return {"ok": False, "error": "shop_not_found"}
+    if store_platform(shop) == "shopify":
+        return _compute_sales_insights_shopify(session, shop, shop_id, days)
     if not shop.woo_site_url or not shop.woo_consumer_key or not shop.woo_consumer_secret:
         return {
             "ok": False,

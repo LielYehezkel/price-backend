@@ -8,7 +8,7 @@ from sqlmodel import Session, select
 
 from backend.models import Alert, CompetitorLink, Product, Shop
 from backend.services.domain_policy import domain_from_url, domain_is_live
-from backend.services.woo_sync import patch_wc_product_regular_price
+from backend.services import store_connector
 
 logger = logging.getLogger(__name__)
 
@@ -99,16 +99,20 @@ def _compute_new_price(product: Product, comp_low: float) -> float | None:
 
 def maybe_apply_auto_pricing(session: Session, product_id: int) -> bool:
     """
-    אחרי עדכון מחירי מתחרים: אם מופעל תמחור אוטומטי — מעדכן WooCommerce ומקומית.
+    אחרי עדכון מחירי מתחרים: אם מופעל תמחור אוטומטי — מעדכן את הקטלוג (Woo/Shopify) ומקומית.
     """
     product = session.get(Product, product_id)
     if not product or not product.auto_pricing_enabled:
         return False
-    if not product.woo_product_id:
-        return False
 
     shop = session.get(Shop, product.shop_id)
-    if not shop or not shop.woo_site_url or not shop.woo_consumer_key or not shop.woo_consumer_secret:
+    if not shop:
+        return False
+    if not store_connector.product_has_store_link(shop, product):
+        return False
+    try:
+        store_connector.ensure_store_connected(shop)
+    except Exception:
         return False
 
     comp_low = _live_competitor_lowest_price(session, product_id)
@@ -122,15 +126,9 @@ def maybe_apply_auto_pricing(session: Session, product_id: int) -> bool:
     old = product.regular_price
     strategy = getattr(product, "auto_pricing_strategy", None) or "reactive_down"
     try:
-        patch_wc_product_regular_price(
-            shop.woo_site_url,
-            shop.woo_consumer_key,
-            shop.woo_consumer_secret,
-            int(product.woo_product_id),
-            new_price,
-        )
+        store_connector.apply_regular_price(shop, product, float(new_price))
     except Exception:
-        logger.exception("auto_pricing: WooCommerce update failed product_id=%s", product_id)
+        logger.exception("auto_pricing: store price update failed product_id=%s", product_id)
         return False
 
     product.regular_price = new_price

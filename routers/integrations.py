@@ -7,6 +7,7 @@ from sqlmodel import Session
 from backend.db import get_session
 from backend.deps import get_current_user
 from backend.models import Shop, User, WpConnectionToken, WpSetupToken, utcnow
+from backend.services.store_connector import store_platform
 from backend.services.woo_sync import fetch_wc_store_currency
 
 router = APIRouter(prefix="/api/integrations", tags=["integrations"])
@@ -48,6 +49,11 @@ def wordpress_connect(
 
     if not shop:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "חנות לא נמצאה")
+    if store_platform(shop) == "shopify":
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "חנות זו מוגדרת כ־Shopify — חיבור WordPress/WooCommerce אינו רלוונטי. השתמשו בהגדרות Shopify.",
+        )
 
     site = body.site_url.strip().rstrip("/")
     ck = body.consumer_key.strip()

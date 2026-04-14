@@ -6,7 +6,7 @@ import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel
 from sqlmodel import Session, select
 
@@ -15,6 +15,8 @@ from backend.db import get_session
 from backend.deps import get_current_user, require_shop_access
 from backend.models import Product, Shop, ShopAiActionLog, ShopWhatsappConfig, ShopWhatsappPendingAction, User, utcnow
 from backend.services.ai_ops import parse_intent_with_openai, rank_product_candidates
+from backend.services import store_connector
+from backend.services.store_connector import store_platform
 from backend.services.woo_sync import (
     effective_wc_price,
     force_wc_product_sale_price_via_meta,
@@ -95,9 +97,8 @@ def _ensure_chat_enabled() -> None:
         raise HTTPException(404, "פיצ'ר צ'אט AI כבוי כרגע")
 
 
-def _ensure_woo_connected(shop) -> None:
-    if not shop.woo_site_url or not shop.woo_consumer_key or not shop.woo_consumer_secret:
-        raise HTTPException(400, "יש לשמור פרטי WooCommerce בהגדרות החנות כדי לבצע פעולה זו.")
+def _ensure_store_connected(shop: Shop) -> None:
+    store_connector.ensure_store_connected(shop)
 
 
 def _build_confirmation_for_price(name: str, old_price: float, new_price: float) -> str:
@@ -173,7 +174,7 @@ async def plan_chat_action(
     if not products:
         return ChatPlanOut(status="cannot_plan", action=intent.action, question="לא נמצאו מוצרים בחנות.")
     try:
-        _ensure_woo_connected(shop)
+        _ensure_store_connected(shop)
     except HTTPException as ex:
         return ChatPlanOut(status="cannot_plan", action=intent.action, question=str(ex.detail))
 
@@ -216,14 +217,9 @@ async def plan_chat_action(
         ops: list[dict[str, Any]] = []
         sample_names: list[str] = []
         for p in selected:
-            if not p.woo_product_id:
+            if not store_connector.product_has_store_link(shop, p):
                 continue
-            wc_row = fetch_wc_product_by_id(
-                shop.woo_site_url,
-                shop.woo_consumer_key,
-                shop.woo_consumer_secret,
-                int(p.woo_product_id),
-            )
+            wc_row = store_connector.fetch_catalog_row(shop, p)
             sale_now = parse_price(wc_row.get("sale_price"))
             regular_now = parse_price(wc_row.get("regular_price")) if wc_row else None
             effective_now = effective_wc_price(wc_row)
@@ -236,16 +232,19 @@ async def plan_chat_action(
             if from_price_val is None:
                 continue
             to_price_val = max(0.0, float(from_price_val) - float(intent.delta_amount))
-            ops.append(
-                {
-                    "product_id": p.id,
-                    "woo_product_id": int(p.woo_product_id),
-                    "product_name": p.name,
-                    "price_field": price_field,
-                    "from_price": float(from_price_val),
-                    "to_price": float(to_price_val),
-                },
-            )
+            op: dict[str, Any] = {
+                "product_id": p.id,
+                "product_name": p.name,
+                "price_field": price_field,
+                "from_price": float(from_price_val),
+                "to_price": float(to_price_val),
+            }
+            if store_platform(shop) == "shopify":
+                op["shopify_variant_id"] = int(p.shopify_variant_id or 0)
+                op["woo_product_id"] = int(p.shopify_product_id or 0)
+            else:
+                op["woo_product_id"] = int(p.woo_product_id or 0)
+            ops.append(op)
             if len(sample_names) < 4:
                 sample_names.append(p.name)
         if not ops:
@@ -313,18 +312,13 @@ async def plan_chat_action(
                 action="reduce_price",
                 question='לא זיהיתי בכמה להוריד את המחיר. נסה לכתוב למשל: "ב-50 ש"ח".',
             )
-        if not target.woo_product_id:
+        if not store_connector.product_has_store_link(shop, target):
             return ChatPlanOut(
                 status="cannot_plan",
                 action="reduce_price",
-                question=f'למוצר "{target.name}" אין מזהה WooCommerce תקין.',
+                question=f'למוצר "{target.name}" אין מזהה קטלוג (WooCommerce/Shopify) תקין.',
             )
-        wc_row = fetch_wc_product_by_id(
-            shop.woo_site_url,
-            shop.woo_consumer_key,
-            shop.woo_consumer_secret,
-            int(target.woo_product_id),
-        )
+        wc_row = store_connector.fetch_catalog_row(shop, target)
         sale_now = parse_price(wc_row.get("sale_price"))
         regular_now = parse_price(wc_row.get("regular_price")) if wc_row else None
         effective_now = effective_wc_price(wc_row)
@@ -367,18 +361,13 @@ async def plan_chat_action(
                 action="increase_price",
                 question='לא זיהיתי בכמה להעלות את המחיר. נסה לכתוב למשל: "ב-50 ש"ח".',
             )
-        if not target.woo_product_id:
+        if not store_connector.product_has_store_link(shop, target):
             return ChatPlanOut(
                 status="cannot_plan",
                 action="increase_price",
-                question=f'למוצר "{target.name}" אין מזהה WooCommerce תקין.',
+                question=f'למוצר "{target.name}" אין מזהה קטלוג (WooCommerce/Shopify) תקין.',
             )
-        wc_row = fetch_wc_product_by_id(
-            shop.woo_site_url,
-            shop.woo_consumer_key,
-            shop.woo_consumer_secret,
-            int(target.woo_product_id),
-        )
+        wc_row = store_connector.fetch_catalog_row(shop, target)
         sale_now = parse_price(wc_row.get("sale_price"))
         regular_now = parse_price(wc_row.get("regular_price")) if wc_row else None
         effective_now = effective_wc_price(wc_row)
@@ -447,7 +436,7 @@ def confirm_chat_action(
     action = str(payload.get("action") or "")
     if not body.approved:
         return ChatConfirmOut(status="cancelled", action=action)
-    _ensure_woo_connected(shop)
+    _ensure_store_connected(shop)
 
     if action == "bulk_reduce_price":
         operations = payload.get("operations")
@@ -457,22 +446,72 @@ def confirm_chat_action(
         for op in operations:
             if not isinstance(op, dict):
                 continue
-            woo_id = int(op.get("woo_product_id"))
             pid = int(op.get("product_id"))
             to_price = float(op.get("to_price"))
             price_field = str(op.get("price_field") or "regular_price")
             pname = str(op.get("product_name") or "")
-            before_row = fetch_wc_product_by_id(
-                shop.woo_site_url,
-                shop.woo_consumer_key,
-                shop.woo_consumer_secret,
-                woo_id,
-            )
+            p_row = session.get(Product, pid)
+            if not p_row or p_row.shop_id != shop_id:
+                continue
+            if not store_connector.product_has_store_link(shop, p_row):
+                continue
+            before_row = store_connector.fetch_catalog_row(shop, p_row)
             before = {
                 "regular_price": parse_price(before_row.get("regular_price")),
                 "sale_price": parse_price(before_row.get("sale_price")),
                 "price_field": price_field,
             }
+            if store_platform(shop) == "shopify":
+                pf = price_field
+                on_sale_before = bool(before_row.get("on_sale"))
+                sale_b = before.get("sale_price")
+                has_sale_before = sale_b is not None and float(sale_b) > 0
+                if pf == "regular_price" and (on_sale_before or has_sale_before):
+                    pf = "sale_price"
+                    before["price_field"] = "sale_price"
+                row_after_dict = store_connector.shopify_confirm_price_change(
+                    shop,
+                    p_row,
+                    action="reduce_price",
+                    price_field=pf,
+                    to_price=float(to_price),
+                    row_before=before_row,
+                )
+                after_regular = parse_price(row_after_dict.get("regular_price"))
+                after_sale = parse_price(row_after_dict.get("sale_price"))
+                observed = after_sale if pf == "sale_price" else after_regular
+                observed_effective = store_connector.effective_catalog_price(row_after_dict)
+                if not _price_almost_equal(observed, to_price) and not _price_almost_equal(
+                    observed_effective,
+                    to_price,
+                ):
+                    raise HTTPException(
+                        status.HTTP_409_CONFLICT,
+                        (
+                            "העדכון נשלח ל-Shopify אבל המחיר בפועל לא השתנה לערך המבוקש. "
+                            f"product_id={pid} field={pf} target={to_price:.2f} observed={observed!s}"
+                        ),
+                    )
+                ne = observed_effective if observed_effective is not None else observed
+                if ne is not None:
+                    p_row.regular_price = float(ne)
+                    session.add(p_row)
+                applied.append(
+                    {
+                        "product_id": pid,
+                        "woo_product_id": int(p_row.woo_product_id or 0),
+                        "shopify_variant_id": int(p_row.shopify_variant_id or 0),
+                        "product_name": pname,
+                        "price_field": pf,
+                        "before": before,
+                        "after": {
+                            "regular_price": after_regular,
+                            "sale_price": after_sale,
+                        },
+                    },
+                )
+                continue
+            woo_id = int(op.get("woo_product_id"))
             if price_field == "sale_price":
                 patch_wc_product_prices(
                     shop.woo_site_url,
@@ -490,7 +529,6 @@ def confirm_chat_action(
                     woo_id,
                     to_price,
                 )
-                p_row = session.get(Product, pid)
                 if p_row and p_row.shop_id == shop_id:
                     p_row.regular_price = to_price
                     session.add(p_row)
@@ -504,6 +542,7 @@ def confirm_chat_action(
                 {
                     "product_id": pid,
                     "woo_product_id": woo_id,
+                    "shopify_variant_id": 0,
                     "product_name": pname,
                     "price_field": price_field,
                     "before": before,
@@ -541,8 +580,8 @@ def confirm_chat_action(
     p = session.get(Product, product_id)
     if not p or p.shop_id != shop_id:
         raise HTTPException(404, "מוצר לא נמצא")
-    if not p.woo_product_id:
-        raise HTTPException(400, "למוצר אין מזהה WooCommerce ולכן אי אפשר לבצע פעולה זו.")
+    if not store_connector.product_has_store_link(shop, p):
+        raise HTTPException(400, "למוצר אין מזהה קטלוג (WooCommerce/Shopify) ולכן אי אפשר לבצע פעולה זו.")
 
     if action in ("reduce_price", "increase_price"):
         to_price_raw = payload.get("to_price")
@@ -552,12 +591,76 @@ def confirm_chat_action(
             raise HTTPException(400, "payload לא תקין: to_price חסר") from None
         delta_amount = float(payload.get("delta_amount") or 0.0)
         price_field = str(payload.get("price_field") or "regular_price")
-        row_before = fetch_wc_product_by_id(
-            shop.woo_site_url,
-            shop.woo_consumer_key,
-            shop.woo_consumer_secret,
-            int(p.woo_product_id),
-        )
+        row_before = store_connector.fetch_catalog_row(shop, p)
+        if store_platform(shop) == "shopify":
+            before = {
+                "regular_price": parse_price(row_before.get("regular_price")),
+                "sale_price": parse_price(row_before.get("sale_price")),
+                "price_field": price_field,
+            }
+            on_sale_before = bool(row_before.get("on_sale"))
+            sale_before = before.get("sale_price")
+            has_sale_price_before = sale_before is not None and float(sale_before) > 0
+            pf = price_field
+            if pf == "regular_price" and (on_sale_before or has_sale_price_before):
+                pf = "sale_price"
+                before["price_field"] = "sale_price"
+            row_after_dict = store_connector.shopify_confirm_price_change(
+                shop,
+                p,
+                action=action,
+                price_field=pf,
+                to_price=float(to_price),
+                row_before=row_before,
+            )
+            after_regular = parse_price(row_after_dict.get("regular_price"))
+            after_sale = parse_price(row_after_dict.get("sale_price"))
+            observed = after_sale if pf == "sale_price" else after_regular
+            observed_effective = store_connector.effective_catalog_price(row_after_dict)
+            if not _price_almost_equal(observed, to_price) and not _price_almost_equal(
+                observed_effective,
+                to_price,
+            ):
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    (
+                        "העדכון נשלח ל-Shopify אבל המחיר בפועל לא השתנה לערך המבוקש. "
+                        f"field={pf} target={to_price:.2f} observed={observed!s}"
+                    ),
+                )
+            ne = observed_effective if observed_effective is not None else observed
+            if ne is not None:
+                p.regular_price = float(ne)
+                session.add(p)
+            session.commit()
+            log_row = _log_ai_action(
+                session,
+                shop_id=shop_id,
+                user_id=user.id or 0,
+                action=action,
+                product_id=p.id,
+                payload={
+                    "price_field": pf,
+                    "product_id": p.id,
+                    "woo_product_id": int(p.woo_product_id or 0),
+                    "shopify_variant_id": int(p.shopify_variant_id or 0),
+                    "before": before,
+                    "after": {"regular_price": after_regular, "sale_price": after_sale},
+                },
+            )
+            return ChatConfirmOut(
+                status="executed",
+                action=action,
+                product_id=p.id,
+                product_name=p.name,
+                before=before,
+                after={
+                    "regular_price": after_regular,
+                    "sale_price": after_sale,
+                    "price_field": pf,
+                },
+                action_log_id=log_row.id,
+            )
         before = {
             "regular_price": parse_price(row_before.get("regular_price")),
             "sale_price": parse_price(row_before.get("sale_price")),
@@ -838,19 +941,21 @@ def confirm_chat_action(
         )
 
     if action == "out_of_stock":
-        row_before = fetch_wc_product_by_id(
-            shop.woo_site_url,
-            shop.woo_consumer_key,
-            shop.woo_consumer_secret,
-            int(p.woo_product_id),
-        )
+        row_before = store_connector.fetch_catalog_row(shop, p)
         before_status = str(row_before.get("stock_status") or "")
-        patch_wc_product_out_of_stock(
-            shop.woo_site_url,
-            shop.woo_consumer_key,
-            shop.woo_consumer_secret,
-            int(p.woo_product_id),
-        )
+        if store_platform(shop) == "shopify":
+            store_connector.set_product_out_of_stock(shop, p)
+            session.add(p)
+            session.commit()
+            wid = int(p.shopify_product_id or p.shopify_variant_id or 0)
+        else:
+            patch_wc_product_out_of_stock(
+                shop.woo_site_url,
+                shop.woo_consumer_key,
+                shop.woo_consumer_secret,
+                int(p.woo_product_id),
+            )
+            wid = int(p.woo_product_id or 0)
         log_row = _log_ai_action(
             session,
             shop_id=shop_id,
@@ -858,8 +963,9 @@ def confirm_chat_action(
             action="out_of_stock",
             product_id=p.id,
             payload={
-                "product_id": p.id,
-                "woo_product_id": int(p.woo_product_id),
+                "product_id": int(p.id),
+                "woo_product_id": wid,
+                "shopify_variant_id": int(p.shopify_variant_id or 0),
                 "before": {"stock_status": before_status},
                 "after": {"stock_status": "outofstock"},
             },
@@ -875,19 +981,21 @@ def confirm_chat_action(
         )
 
     if action == "in_stock":
-        row_before = fetch_wc_product_by_id(
-            shop.woo_site_url,
-            shop.woo_consumer_key,
-            shop.woo_consumer_secret,
-            int(p.woo_product_id),
-        )
+        row_before = store_connector.fetch_catalog_row(shop, p)
         before_status = str(row_before.get("stock_status") or "")
-        patch_wc_product_in_stock(
-            shop.woo_site_url,
-            shop.woo_consumer_key,
-            shop.woo_consumer_secret,
-            int(p.woo_product_id),
-        )
+        if store_platform(shop) == "shopify":
+            store_connector.set_product_in_stock(shop, p, default_qty=1)
+            session.add(p)
+            session.commit()
+            wid = int(p.shopify_product_id or p.shopify_variant_id or 0)
+        else:
+            patch_wc_product_in_stock(
+                shop.woo_site_url,
+                shop.woo_consumer_key,
+                shop.woo_consumer_secret,
+                int(p.woo_product_id),
+            )
+            wid = int(p.woo_product_id or 0)
         log_row = _log_ai_action(
             session,
             shop_id=shop_id,
@@ -895,8 +1003,9 @@ def confirm_chat_action(
             action="in_stock",
             product_id=p.id,
             payload={
-                "product_id": p.id,
-                "woo_product_id": int(p.woo_product_id),
+                "product_id": int(p.id),
+                "woo_product_id": wid,
+                "shopify_variant_id": int(p.shopify_variant_id or 0),
                 "before": {"stock_status": before_status},
                 "after": {"stock_status": "instock"},
             },
@@ -984,60 +1093,102 @@ def undo_ai_action(
         session.add(row)
         session.commit()
         return UndoOut(ok=False, action_id=action_id, status=row.status, detail="חלון הזמן לביטול פג")
-    _ensure_woo_connected(shop)
+    _ensure_store_connected(shop)
     try:
         payload = json.loads(row.payload_json or "{}")
     except Exception:
         payload = {}
     try:
         if row.action in ("reduce_price", "increase_price"):
-            woo_id = int(payload.get("woo_product_id"))
-            price_field = str(payload.get("price_field") or "regular_price")
-            before = payload.get("before") or {}
-            old_val = before.get("sale_price" if price_field == "sale_price" else "regular_price")
-            if old_val is None:
-                raise ValueError("missing previous price")
-            if price_field == "sale_price":
-                patch_wc_product_sale_price(
-                    shop.woo_site_url,
-                    shop.woo_consumer_key,
-                    shop.woo_consumer_secret,
-                    woo_id,
-                    float(old_val),
-                )
-            else:
-                patch_wc_product_regular_price(
-                    shop.woo_site_url,
-                    shop.woo_consumer_key,
-                    shop.woo_consumer_secret,
-                    woo_id,
-                    float(old_val),
-                )
+            if store_platform(shop) == "shopify":
                 pid = payload.get("product_id")
                 p = session.get(Product, int(pid)) if pid is not None else None
-                if p and p.shop_id == shop_id:
-                    p.regular_price = float(old_val)
+                if not p or p.shop_id != shop_id:
+                    raise ValueError("product missing for undo")
+                before = payload.get("before") or {}
+                store_connector.restore_prices_from_snapshot(shop, p, before)
+                row_after_u = store_connector.fetch_catalog_row(shop, p)
+                ne = store_connector.effective_catalog_price(row_after_u)
+                if ne is not None:
+                    p.regular_price = float(ne)
                     session.add(p)
+            else:
+                woo_id = int(payload.get("woo_product_id"))
+                price_field = str(payload.get("price_field") or "regular_price")
+                before = payload.get("before") or {}
+                old_val = before.get("sale_price" if price_field == "sale_price" else "regular_price")
+                if old_val is None:
+                    raise ValueError("missing previous price")
+                if price_field == "sale_price":
+                    patch_wc_product_sale_price(
+                        shop.woo_site_url,
+                        shop.woo_consumer_key,
+                        shop.woo_consumer_secret,
+                        woo_id,
+                        float(old_val),
+                    )
+                else:
+                    patch_wc_product_regular_price(
+                        shop.woo_site_url,
+                        shop.woo_consumer_key,
+                        shop.woo_consumer_secret,
+                        woo_id,
+                        float(old_val),
+                    )
+                    pid = payload.get("product_id")
+                    p = session.get(Product, int(pid)) if pid is not None else None
+                    if p and p.shop_id == shop_id:
+                        p.regular_price = float(old_val)
+                        session.add(p)
         elif row.action == "out_of_stock":
-            patch_wc_product_in_stock(
-                shop.woo_site_url,
-                shop.woo_consumer_key,
-                shop.woo_consumer_secret,
-                int(payload.get("woo_product_id")),
-            )
+            if store_platform(shop) == "shopify":
+                pid = payload.get("product_id")
+                p = session.get(Product, int(pid)) if pid is not None else None
+                if not p or p.shop_id != shop_id:
+                    raise ValueError("product missing for undo")
+                store_connector.set_product_in_stock(shop, p, default_qty=1)
+                session.add(p)
+            else:
+                patch_wc_product_in_stock(
+                    shop.woo_site_url,
+                    shop.woo_consumer_key,
+                    shop.woo_consumer_secret,
+                    int(payload.get("woo_product_id")),
+                )
         elif row.action == "in_stock":
-            patch_wc_product_out_of_stock(
-                shop.woo_site_url,
-                shop.woo_consumer_key,
-                shop.woo_consumer_secret,
-                int(payload.get("woo_product_id")),
-            )
+            if store_platform(shop) == "shopify":
+                pid = payload.get("product_id")
+                p = session.get(Product, int(pid)) if pid is not None else None
+                if not p or p.shop_id != shop_id:
+                    raise ValueError("product missing for undo")
+                store_connector.set_product_out_of_stock(shop, p)
+                session.add(p)
+            else:
+                patch_wc_product_out_of_stock(
+                    shop.woo_site_url,
+                    shop.woo_consumer_key,
+                    shop.woo_consumer_secret,
+                    int(payload.get("woo_product_id")),
+                )
         elif row.action == "bulk_reduce_price":
             ops = payload.get("operations")
             if not isinstance(ops, list):
                 raise ValueError("missing bulk operations")
             for op in ops:
                 if not isinstance(op, dict):
+                    continue
+                if store_platform(shop) == "shopify":
+                    pid = op.get("product_id")
+                    p = session.get(Product, int(pid)) if pid is not None else None
+                    if not p or p.shop_id != shop_id:
+                        continue
+                    before = op.get("before") or {}
+                    store_connector.restore_prices_from_snapshot(shop, p, before)
+                    row_after_u = store_connector.fetch_catalog_row(shop, p)
+                    ne = store_connector.effective_catalog_price(row_after_u)
+                    if ne is not None:
+                        p.regular_price = float(ne)
+                        session.add(p)
                     continue
                 woo_id = int(op.get("woo_product_id"))
                 price_field = str(op.get("price_field") or "regular_price")

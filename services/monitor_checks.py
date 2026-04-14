@@ -34,7 +34,7 @@ from backend.services.fetch_html import (
     normalize_fetch_strategy,
 )
 from backend.services.price_sanity import validate_competitor_price
-from backend.services.woo_sync import effective_wc_price, fetch_wc_product_by_id
+from backend.services import store_connector
 
 logger = logging.getLogger(__name__)
 
@@ -114,9 +114,7 @@ def _refresh_our_price_if_stale(session: Session, shop: Shop, product: Product) 
     רענון נקודתי למחיר המוצר מהחנות לפני השוואה מול מתחרה.
     עדכון מחיר נשמר רק אם השתנה בפועל.
     """
-    if not product.woo_product_id:
-        return
-    if not shop.woo_site_url or not shop.woo_consumer_key or not shop.woo_consumer_secret:
+    if not store_connector.product_has_store_link(shop, product):
         return
 
     # מוצרים בסריקה צריכים דיוק גבוה, אך בלי להציף את השרת.
@@ -124,29 +122,7 @@ def _refresh_our_price_if_stale(session: Session, shop: Shop, product: Product) 
     if not _is_our_price_stale(product, max_age_seconds=ttl_seconds):
         return
 
-    try:
-        row = fetch_wc_product_by_id(
-            shop.woo_site_url,
-            shop.woo_consumer_key,
-            shop.woo_consumer_secret,
-            int(product.woo_product_id),
-        )
-    except Exception:
-        # כשל רשת נקודתי לא אמור לעצור את הסריקה; נמשיך עם המחיר הקיים.
-        return
-
-    new_price = effective_wc_price(row)
-    old_price = product.regular_price
-    if old_price is None or new_price is None:
-        changed = old_price != new_price
-    else:
-        changed = abs(float(old_price) - float(new_price)) > 0.005
-    if changed:
-        product.regular_price = new_price
-    product.last_price_sync_at = utcnow()
-    session.add(product)
-    session.commit()
-    session.refresh(product)
+    store_connector.refresh_product_price_if_stale(session, shop, product, ttl_seconds=ttl_seconds)
 
 
 def run_competitor_check(session: Session, competitor_id: int) -> CompetitorCheckResult:

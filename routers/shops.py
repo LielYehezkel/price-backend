@@ -1,5 +1,6 @@
 import csv
 import hashlib
+import logging
 import io
 import json
 import re
@@ -10,7 +11,7 @@ from io import BytesIO
 
 from openpyxl import Workbook, load_workbook
 from datetime import datetime, timedelta, timezone
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 from urllib.parse import urlparse
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Query, Request, Response, UploadFile, status
@@ -35,6 +36,7 @@ from backend.models import (
     Shop,
     ShopOwnershipTransfer,
     ShopMember,
+    ShopWhatsappConfig,
     TrackedCompetitor,
     User,
     UserShopPreferences,
@@ -57,6 +59,9 @@ from backend.services.extract import run_extraction_pipeline
 from backend.services.fetch_html import fetch_html_sync
 from backend.services.monitor_checks import run_competitor_check
 from backend.services.system_config import resolve_public_api_base
+from backend.services import shopify_sync
+from backend.services import store_connector
+from backend.services.store_connector import store_platform
 from backend.services.wp_plugin_packager import build_plugin_zip_bytes
 from backend.services.woo_sync import (
     effective_wc_price,
@@ -67,19 +72,23 @@ from backend.services.woo_sync import (
 )
 
 router = APIRouter(prefix="/api/shops", tags=["shops"])
+log = logging.getLogger(__name__)
 
 
 class ShopOut(BaseModel):
     id: int
     name: str
+    store_platform: str = "wordpress"
     check_interval_hours: int
     check_interval_minutes: int
     woocommerce_configured: bool
+    shopify_configured: bool = False
     woo_currency: str | None = None
 
 
 class ShopCreate(BaseModel):
     name: str
+    store_platform: Literal["wordpress", "shopify"] | None = None
 
 
 class ShopPatch(BaseModel):
@@ -299,6 +308,13 @@ class WooConfig(BaseModel):
     consumer_secret: str
 
 
+class ShopifyConfig(BaseModel):
+    shop_domain: str
+    admin_access_token: str
+    api_version: str | None = None
+    client_secret: str | None = None  # Custom App API secret — for order webhook HMAC
+
+
 class OwnershipTransferCreateIn(BaseModel):
     target_email: str
     note: str | None = None
@@ -343,12 +359,20 @@ def _shop_to_out(s: Shop) -> ShopOut:
     if mins is None or mins < 1:
         mins = max(1, int((s.check_interval_hours or 6) * 60))
     mins = max(1, min(int(mins), 60 * 24 * 14))
+    plat = (getattr(s, "store_platform", None) or "wordpress").strip().lower()
+    if plat not in ("wordpress", "shopify"):
+        plat = "wordpress"
+    dom = (getattr(s, "shopify_shop_domain", None) or "").strip()
+    stok = (getattr(s, "shopify_admin_access_token", None) or "").strip()
+    shopify_ok = bool(dom and stok)
     return ShopOut(
         id=s.id,
         name=s.name,
+        store_platform=plat,
         check_interval_hours=s.check_interval_hours,
         check_interval_minutes=mins,
         woocommerce_configured=bool(s.woo_site_url and s.woo_consumer_key),
+        shopify_configured=shopify_ok,
         woo_currency=getattr(s, "woo_currency", None),
     )
 
@@ -398,9 +422,13 @@ def create_shop(
     session: Annotated[Session, Depends(get_session)],
     user: Annotated[User, Depends(get_current_user)],
 ):
+    plat = (body.store_platform or "wordpress").strip().lower()
+    if plat not in ("wordpress", "shopify"):
+        plat = "wordpress"
     shop = Shop(
         name=body.name,
         owner_id=user.id,
+        store_platform=plat,
         package_tier="free",
         package_max_scan_runs_per_day=10,
         package_max_scans_per_day_window=1,
@@ -1087,77 +1115,20 @@ def sync_shop(
     user: Annotated[User, Depends(get_current_user)],
 ):
     shop = require_shop_access(session, user, shop_id)
-    if not shop.woo_site_url or not shop.woo_consumer_key or not shop.woo_consumer_secret:
-        raise HTTPException(400, "יש לשמור פרטי WooCommerce בהגדרות")
     try:
-        rows = fetch_wc_products(shop.woo_site_url, shop.woo_consumer_key, shop.woo_consumer_secret)
-        cur = fetch_wc_store_currency(shop.woo_site_url, shop.woo_consumer_key, shop.woo_consumer_secret)
+        n = store_connector.sync_products_from_store(session, shop)
+    except HTTPException:
+        raise
     except Exception as ex:
+        if store_platform(shop) == "shopify":
+            raise HTTPException(
+                400,
+                f"סנכרון מול Shopify נכשל: {ex!s}. בדקו דומיין myshopify.com, טוקן Admin API והרשאות (מוצרים/מלאי).",
+            ) from ex
         raise HTTPException(
             400,
             f"סנכרון מול WooCommerce נכשל: {ex!s}. בדקו כתובת אתר, מפתחות API, SSL והרשאות read_write.",
         ) from ex
-    if cur:
-        shop.woo_currency = cur
-        session.add(shop)
-    n = 0
-    for r in rows:
-        if not isinstance(r, dict):
-            continue
-        wid = r.get("id")
-        name = r.get("name") or "—"
-        sku = r.get("sku")
-        link = r.get("permalink")
-        # מחיר מכירה בפועל: אם יש מבצע Woo מחזיר אותו ב-price.
-        # fallback ל-sale_price ואז ל-regular_price.
-        price = effective_wc_price(r)
-        img = first_product_image_url(r)
-        cats_raw = r.get("categories")
-        cat_names: list[str] = []
-        if isinstance(cats_raw, list):
-            for c in cats_raw:
-                if isinstance(c, dict):
-                    nm = str(c.get("name") or "").strip()
-                    if nm:
-                        cat_names.append(nm)
-        category_name = cat_names[0] if cat_names else None
-        category_path = " > ".join(cat_names) if cat_names else None
-        existing = session.exec(
-            select(Product).where(Product.shop_id == shop.id, Product.woo_product_id == wid)
-        ).first()
-        if existing:
-            existing.name = str(name)
-            existing.sku = str(sku) if sku else None
-            existing.permalink = str(link) if link else None
-            old_price = existing.regular_price
-            if old_price is None or price is None:
-                changed = old_price != price
-            else:
-                changed = abs(float(old_price) - float(price)) > 0.005
-            if changed:
-                existing.regular_price = price
-            existing.last_price_sync_at = utcnow()
-            existing.image_url = img
-            existing.category_name = category_name
-            existing.category_path = category_path
-            session.add(existing)
-        else:
-            session.add(
-                Product(
-                    shop_id=shop.id,
-                    woo_product_id=int(wid) if wid is not None else None,
-                    name=str(name),
-                    sku=str(sku) if sku else None,
-                    permalink=str(link) if link else None,
-                    image_url=img,
-                    category_name=category_name,
-                    category_path=category_path,
-                    regular_price=price,
-                    last_price_sync_at=utcnow(),
-                )
-            )
-        n += 1
-    session.commit()
     return {"synced": n}
 
 
@@ -1172,70 +1143,15 @@ def refresh_shop_prices(
     בלי לייבא מחדש את כל הקטלוג ומבלי להוסיף מוצרים חדשים מהחנות.
     """
     shop = require_shop_access(session, user, shop_id)
-    if not shop.woo_site_url or not shop.woo_consumer_key or not shop.woo_consumer_secret:
-        raise HTTPException(400, "יש לשמור פרטי WooCommerce בהגדרות")
-
-    rows = list(
-        session.exec(
-            select(Product).where(
-                Product.shop_id == shop_id,
-                Product.woo_product_id.is_not(None),
-            ),
-        ).all(),
-    )
-    woo_ids = sorted({int(p.woo_product_id) for p in rows if p.woo_product_id is not None})
-    if not woo_ids:
-        return {"checked": 0, "updated": 0, "missing_in_woo": 0}
-
     try:
-        wc_by_id = fetch_wc_products_by_ids(
-            shop.woo_site_url,
-            shop.woo_consumer_key,
-            shop.woo_consumer_secret,
-            woo_ids,
-        )
+        return store_connector.refresh_all_product_prices(session, shop)
+    except HTTPException:
+        raise
     except Exception as ex:
         raise HTTPException(
             400,
-            f"רענון מחירים מול WooCommerce נכשל: {ex!s}. בדקו חיבור, מפתחות API והרשאות.",
+            f"רענון מחירים נכשל: {ex!s}.",
         ) from ex
-
-    cur = fetch_wc_store_currency(shop.woo_site_url, shop.woo_consumer_key, shop.woo_consumer_secret)
-    if cur:
-        shop.woo_currency = cur
-        session.add(shop)
-
-    now = utcnow()
-    updated = 0
-    checked = len(rows)
-    missing = 0
-
-    for p in rows:
-        if p.woo_product_id is None:
-            continue
-        wid = int(p.woo_product_id)
-        row = wc_by_id.get(wid)
-        if not row:
-            missing += 1
-            continue
-        new_price = effective_wc_price(row)
-        old_price = p.regular_price
-        if old_price is None or new_price is None:
-            price_changed = old_price != new_price
-        else:
-            price_changed = abs(float(old_price) - float(new_price)) > 0.005
-        if price_changed:
-            p.regular_price = new_price
-            updated += 1
-        p.last_price_sync_at = now
-        session.add(p)
-
-    session.commit()
-    return {
-        "checked": checked,
-        "updated": updated,
-        "missing_in_woo": missing,
-    }
 
 
 @router.get("/{shop_id}/products", response_model=ProductPageOut)
@@ -2221,6 +2137,11 @@ def save_woo(
     user: Annotated[User, Depends(get_current_user)],
 ):
     shop = require_shop_access(session, user, shop_id)
+    if store_platform(shop) == "shopify":
+        raise HTTPException(
+            400,
+            "חנות Shopify — השתמשו בחיבור Shopify (דומיין + Admin API token) ולא ב־WooCommerce.",
+        )
     shop.woo_site_url = body.site_url.rstrip("/")
     shop.woo_consumer_key = body.consumer_key.strip()
     shop.woo_consumer_secret = body.consumer_secret.strip()
@@ -2232,6 +2153,89 @@ def save_woo(
     return {"ok": True, "woo_currency": shop.woo_currency}
 
 
+@router.post("/{shop_id}/shopify")
+def save_shopify(
+    shop_id: int,
+    body: ShopifyConfig,
+    session: Annotated[Session, Depends(get_session)],
+    user: Annotated[User, Depends(get_current_user)],
+):
+    shop = require_shop_access(session, user, shop_id)
+    if store_platform(shop) != "shopify":
+        raise HTTPException(
+            400,
+            "חנות זו אינה מסוג Shopify. צרו חנות חדשה ובחרו Shopify, או פנו למנהל המערכת.",
+        )
+    dom = shopify_sync.normalize_shopify_domain(body.shop_domain)
+    tok = body.admin_access_token.strip()
+    if not dom or not tok:
+        raise HTTPException(400, "דומיין Shopify וטוקן Admin API חובה")
+    ver = (body.api_version or "").strip() or None
+    try:
+        shopify_sync.verify_shop_credentials(dom, tok, ver)
+    except Exception as ex:
+        raise HTTPException(400, f"אימות מול Shopify נכשל: {ex!s}") from ex
+    shop.shopify_shop_domain = dom
+    shop.shopify_admin_access_token = tok
+    if ver:
+        shop.shopify_api_version = ver
+    if not getattr(shop, "shopify_webhook_secret", None):
+        shop.shopify_webhook_secret = secrets.token_hex(24)
+    cs = (body.client_secret or "").strip()
+    if cs:
+        shop.shopify_client_secret = cs
+    cur = shopify_sync.fetch_shop_currency_code(shop)
+    if cur:
+        shop.woo_currency = cur
+    session.add(shop)
+    session.commit()
+    return {
+        "ok": True,
+        "woo_currency": shop.woo_currency,
+        "shopify_webhook_secret": shop.shopify_webhook_secret,
+        "shopify_orders_webhook_path": f"/api/shops/{shop_id}/shopify/webhooks/orders",
+    }
+
+
+@router.post("/{shop_id}/shopify/webhooks/orders")
+async def shopify_orders_webhook(
+    shop_id: int,
+    request: Request,
+    session: Annotated[Session, Depends(get_session)],
+):
+    """Shopify Admin order create/update webhook — verify HMAC with Custom App API client secret."""
+    raw = await request.body()
+    shop = session.get(Shop, shop_id)
+    if not shop or store_platform(shop) != "shopify":
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "חנות לא נמצאה")
+    secret = (getattr(shop, "shopify_client_secret", None) or "").strip()
+    if not secret:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "חסר Client secret של האפליקציה ב-Shopify — שמרו אותו בהגדרות החנות לאימות webhook.",
+        )
+    hmac_header = request.headers.get("x-shopify-hmac-sha256") or request.headers.get("X-Shopify-Hmac-Sha256")
+    if not shopify_sync.verify_webhook_hmac(raw, hmac_header, secret):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "HMAC לא תקין")
+    try:
+        payload = json.loads(raw.decode("utf-8") or "{}")
+    except Exception as ex:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, f"JSON לא תקין: {ex!s}") from ex
+    if not isinstance(payload, dict):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "payload לא תקין")
+    from backend.services.sales_notifications import handle_woo_sale_event
+
+    cfg = session.exec(select(ShopWhatsappConfig).where(ShopWhatsappConfig.shop_id == shop_id)).first()
+    if not cfg:
+        return {"ok": True, "processed": False, "detail": "whatsapp_not_configured"}
+    ok = False
+    try:
+        ok = handle_woo_sale_event(session, cfg, payload)
+    except Exception:
+        log.exception("shopify order webhook handler failed shop_id=%s", shop_id)
+    return {"ok": True, "processed": ok}
+
+
 @router.get("/{shop_id}/wordpress-plugin.zip")
 def download_wordpress_plugin_zip(
     shop_id: int,
@@ -2241,6 +2245,12 @@ def download_wordpress_plugin_zip(
     api_base_override: str | None = Query(None, alias="api_base"),
 ):
     require_shop_access(session, user, shop_id)
+    shop = session.get(Shop, shop_id)
+    if shop and store_platform(shop) == "shopify":
+        raise HTTPException(
+            400,
+            "חנות Shopify לא משתמשת בתוסף WordPress. חברו את החנות דרך מסך הגדרות Shopify.",
+        )
     row = session.exec(
         select(WpConnectionToken).where(
             WpConnectionToken.shop_id == shop_id,

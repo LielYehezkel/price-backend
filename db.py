@@ -100,6 +100,46 @@ def _migrate_shop_packages() -> None:
             log.warning("Migration failed: shop package backfill: %s", ex)
 
 
+def _migrate_shop_platform_shopify() -> None:
+    shop_cols = [
+        ("store_platform", "VARCHAR DEFAULT 'wordpress'"),
+        ("shopify_shop_domain", "VARCHAR"),
+        ("shopify_admin_access_token", "VARCHAR"),
+        ("shopify_api_version", "VARCHAR DEFAULT '2024-10'"),
+        ("shopify_webhook_secret", "VARCHAR"),
+        ("shopify_client_secret", "VARCHAR"),
+    ]
+    for name, typ in shop_cols:
+        with engine.begin() as conn:
+            try:
+                conn.execute(text(f"ALTER TABLE shop ADD COLUMN {name} {typ}"))
+            except Exception as ex:
+                if not _is_duplicate_column_error(ex):
+                    log.warning("Migration failed: shop.%s: %s", name, ex)
+    with engine.begin() as conn:
+        try:
+            conn.execute(
+                text(
+                    "UPDATE shop SET store_platform = 'wordpress' "
+                    "WHERE store_platform IS NULL OR store_platform = ''",
+                ),
+            )
+        except Exception as ex:
+            log.warning("Migration failed: shop store_platform backfill: %s", ex)
+    prod_cols = [
+        ("shopify_product_id", "INTEGER"),
+        ("shopify_variant_id", "INTEGER"),
+        ("shopify_inventory_item_id", "INTEGER"),
+    ]
+    for name, typ in prod_cols:
+        with engine.begin() as conn:
+            try:
+                conn.execute(text(f"ALTER TABLE product ADD COLUMN {name} {typ}"))
+            except Exception as ex:
+                if not _is_duplicate_column_error(ex):
+                    log.warning("Migration failed: product.%s: %s", name, ex)
+
+
 def _migrate_shop_scan_quota_daily() -> None:
     with engine.begin() as conn:
         try:
@@ -474,6 +514,7 @@ def init_db() -> None:
     _migrate_shop_setup_and_pricing_strategy()
     _migrate_shop_woo_currency()
     _migrate_shop_packages()
+    _migrate_shop_platform_shopify()
     _migrate_shop_scan_quota_daily()
     _migrate_shop_package_audit_log()
     _migrate_product_extended()

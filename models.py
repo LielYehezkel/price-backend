@@ -34,6 +34,12 @@ class Shop(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     name: str
     owner_id: int = Field(foreign_key="user.id")
+    store_platform: str = Field(default="wordpress", index=True)  # wordpress | shopify
+    shopify_shop_domain: Optional[str] = None  # e.g. my-store.myshopify.com
+    shopify_admin_access_token: Optional[str] = None
+    shopify_api_version: str = Field(default="2024-10")
+    shopify_webhook_secret: Optional[str] = None  # random URL token / internal ref
+    shopify_client_secret: Optional[str] = None  # Custom App API secret — verifies X-Shopify-Hmac-Sha256
     check_interval_hours: int = Field(default=6)  # legacy; prefer check_interval_minutes
     check_interval_minutes: int = Field(default=360)  # default = 6h; min 1 for testing
     package_tier: str = Field(default="free", index=True)  # free | basic | premium
@@ -76,6 +82,9 @@ class Product(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     shop_id: int = Field(foreign_key="shop.id", index=True)
     woo_product_id: Optional[int] = None
+    shopify_product_id: Optional[int] = None
+    shopify_variant_id: Optional[int] = None
+    shopify_inventory_item_id: Optional[int] = None
     name: str
     sku: Optional[str] = None
     permalink: Optional[str] = None

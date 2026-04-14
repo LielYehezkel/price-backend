@@ -50,6 +50,34 @@ def _owner_prefs(session: Session, shop: Shop) -> UserShopPreferences | None:
     ).first()
 
 
+def _shopify_order_to_woo_like(order: dict[str, Any]) -> dict[str, Any]:
+    """Map a Shopify Admin REST order JSON into the shape expected by handle_woo_sale_event."""
+    fin = str(order.get("financial_status") or "")
+    mapped = "pending"
+    if fin in ("paid", "partially_paid", "authorized", "partially_refunded"):
+        mapped = "processing"
+    lines = order.get("line_items") if isinstance(order.get("line_items"), list) else []
+    woo_lines: list[dict[str, Any]] = []
+    for li in lines:
+        if not isinstance(li, dict):
+            continue
+        nm = str(li.get("title") or li.get("name") or "")
+        woo_lines.append({"name": nm})
+    return {
+        "id": order.get("id"),
+        "status": mapped,
+        "total": order.get("current_total_price") or order.get("total_price"),
+        "currency": order.get("currency") or order.get("presentment_currency"),
+        "line_items": woo_lines,
+    }
+
+
+def normalize_order_sale_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    if "financial_status" in payload and isinstance(payload.get("line_items"), list):
+        return _shopify_order_to_woo_like(payload)
+    return payload
+
+
 def _fmt_money(amount: float | int | None, currency: str | None) -> str:
     try:
         a = float(amount or 0.0)
@@ -64,12 +92,13 @@ def handle_woo_sale_event(
     cfg: ShopWhatsappConfig,
     payload: dict[str, Any],
 ) -> bool:
-    """Send live sale alert from Woo webhook payload."""
+    """Send live sale alert from Woo or Shopify order webhook payload."""
     if not cfg.enabled or not cfg.access_token or not cfg.phone_number_id or not cfg.shop_id:
         return False
     shop = session.get(Shop, cfg.shop_id)
     if not shop:
         return False
+    payload = normalize_order_sale_payload(payload)
     prefs = _owner_prefs(session, shop)
     if not prefs or not prefs.notify_sale_live:
         return False
