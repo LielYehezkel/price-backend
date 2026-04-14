@@ -21,6 +21,11 @@ class TestAiOps(unittest.TestCase):
         self.assertEqual(intent.action, "increase_price")
         self.assertEqual(intent.delta_amount, 50.0)
 
+    def test_parse_price_increase_without_preposition(self) -> None:
+        intent = parse_intent_rule_based('תעלה את המחיר של מערכת ישיבה ספרד 50 ש"ח')
+        self.assertEqual(intent.action, "increase_price")
+        self.assertEqual(intent.delta_amount, 50.0)
+
     def test_parse_stock_command(self) -> None:
         intent = parse_intent_rule_based("תוריד את בורדו 4 מושבים מהמלאי")
         self.assertEqual(intent.action, "out_of_stock")

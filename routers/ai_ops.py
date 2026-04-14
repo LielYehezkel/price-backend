@@ -107,6 +107,12 @@ def _build_confirmation_for_bulk_reduce(count: int, delta: float, scope_label: s
     return f'האם להוריד {delta:,.2f} ש"ח ל-{count} מוצרים ({scope_label})?'
 
 
+def _price_almost_equal(a: float | None, b: float | None, eps: float = 0.011) -> bool:
+    if a is None or b is None:
+        return False
+    return abs(float(a) - float(b)) <= eps
+
+
 def _log_ai_action(
     session: Session,
     *,
@@ -524,6 +530,7 @@ def confirm_chat_action(
             to_price = float(to_price_raw)
         except (TypeError, ValueError):
             raise HTTPException(400, "payload לא תקין: to_price חסר") from None
+        delta_amount = float(payload.get("delta_amount") or 0.0)
         price_field = str(payload.get("price_field") or "regular_price")
         row_before = fetch_wc_product_by_id(
             shop.woo_site_url,
@@ -537,6 +544,22 @@ def confirm_chat_action(
             "price_field": price_field,
         }
         if price_field == "sale_price":
+            if action == "increase_price":
+                regular_before = before.get("regular_price")
+                sale_before = before.get("sale_price")
+                if (
+                    regular_before is not None
+                    and sale_before is not None
+                    and to_price >= float(regular_before)
+                ):
+                    spread = max(float(regular_before) - float(sale_before), 0.01)
+                    patch_wc_product_regular_price(
+                        shop.woo_site_url,
+                        shop.woo_consumer_key,
+                        shop.woo_consumer_secret,
+                        int(p.woo_product_id),
+                        float(to_price + spread),
+                    )
             patch_wc_product_sale_price(
                 shop.woo_site_url,
                 shop.woo_consumer_key,
@@ -561,6 +584,17 @@ def confirm_chat_action(
             shop.woo_consumer_secret,
             int(p.woo_product_id),
         )
+        after_regular = parse_price(row_after.get("regular_price"))
+        after_sale = parse_price(row_after.get("sale_price"))
+        observed = after_sale if price_field == "sale_price" else after_regular
+        if not _price_almost_equal(observed, to_price):
+            raise HTTPException(
+                409,
+                (
+                    "העדכון נשלח ל-WooCommerce אבל המחיר בפועל לא השתנה לערך המבוקש. "
+                    f"field={price_field} target={to_price:.2f} observed={observed!s} delta={delta_amount:.2f}"
+                ),
+            )
         log_row = _log_ai_action(
             session,
             shop_id=shop_id,
@@ -573,8 +607,8 @@ def confirm_chat_action(
                 "woo_product_id": int(p.woo_product_id),
                 "before": before,
                 "after": {
-                    "regular_price": parse_price(row_after.get("regular_price")),
-                    "sale_price": parse_price(row_after.get("sale_price")),
+                    "regular_price": after_regular,
+                    "sale_price": after_sale,
                 },
             },
         )
@@ -585,8 +619,8 @@ def confirm_chat_action(
             product_name=p.name,
             before=before,
             after={
-                "regular_price": parse_price(row_after.get("regular_price")),
-                "sale_price": parse_price(row_after.get("sale_price")),
+                "regular_price": after_regular,
+                "sale_price": after_sale,
                 "price_field": price_field,
             },
             action_log_id=log_row.id,
