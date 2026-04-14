@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import secrets
 from datetime import timedelta
 from typing import Annotated, Any, Literal
@@ -22,9 +23,10 @@ from backend.services.woo_sync import (
     patch_wc_product_regular_price,
     patch_wc_product_sale_price,
 )
-from backend.services.whatsapp_cloud import send_test_text_message, validate_phone_number_id
+from backend.services.whatsapp_cloud import send_interactive_confirm_buttons, send_test_text_message, validate_phone_number_id
 
 router = APIRouter(prefix="/api/shops", tags=["ai-ops"])
+log = logging.getLogger(__name__)
 
 
 class ChatPlanIn(BaseModel):
@@ -1099,15 +1101,19 @@ async def whatsapp_webhook_receive(
         text = (m.get("text") or "").strip()
         if not sender or not text:
             continue
-        await _process_whatsapp_text_message(
-            session=session,
-            cfg=cfg,
-            shop=shop,
-            actor_user=actor_user,
-            sender_phone=sender,
-            text=text,
-        )
-        handled += 1
+        try:
+            await _process_whatsapp_text_message(
+                session=session,
+                cfg=cfg,
+                shop=shop,
+                actor_user=actor_user,
+                sender_phone=sender,
+                text=text,
+            )
+            handled += 1
+        except Exception as ex:
+            log.exception("whatsapp webhook message processing failed shop_id=%s sender=%s", cfg.shop_id, sender)
+            _send_whatsapp_reply(cfg, sender, f"שגיאה בביצוע הפעולה: {ex!s}")
     return {"ok": True, "shop_id": cfg.shop_id, "enabled": cfg.enabled, "handled_messages": handled}
 
 
@@ -1162,12 +1168,17 @@ def _extract_incoming_whatsapp_messages(payload: Any) -> list[dict[str, str]]:
 
 def _is_whatsapp_yes(text: str) -> bool:
     t = (text or "").strip().lower()
-    return t in {"כן", "כן.", "אשר", "אישור", "בצע", "תבצע", "yes", "ok", "okay"}
+    t = t.replace(",", " ").replace(".", " ")
+    return (
+        t in {"כן", "אשר", "אישור", "בצע", "תבצע", "yes", "ok", "okay", "confirm_yes"}
+        or ("כן" in t and ("בצע" in t or "אשר" in t))
+    )
 
 
 def _is_whatsapp_no(text: str) -> bool:
     t = (text or "").strip().lower()
-    return t in {"לא", "לא.", "בטל", "ביטול", "no", "cancel"}
+    t = t.replace(",", " ").replace(".", " ")
+    return t in {"לא", "בטל", "ביטול", "no", "cancel", "confirm_no"} or ("לא" in t and "בטל" in t)
 
 
 async def _process_whatsapp_text_message(
@@ -1201,12 +1212,17 @@ async def _process_whatsapp_text_message(
             payload = json.loads(pending.pending_payload_json or "{}")
         except Exception:
             payload = {}
-        res = confirm_chat_action(
-            shop_id=int(shop.id or 0),
-            body=ChatConfirmIn(approved=True, payload=payload),
-            session=session,
-            user=actor_user,
-        )
+        try:
+            res = confirm_chat_action(
+                shop_id=int(shop.id or 0),
+                body=ChatConfirmIn(approved=True, payload=payload),
+                session=session,
+                user=actor_user,
+            )
+        except Exception as ex:
+            log.exception("whatsapp confirm failed shop_id=%s sender=%s", shop.id, sender_phone)
+            _send_whatsapp_reply(cfg, sender_phone, f"שגיאה בביצוע הפעולה: {ex!s}")
+            return
         session.delete(pending)
         session.commit()
         if res.status == "executed":
@@ -1243,7 +1259,7 @@ async def _process_whatsapp_text_message(
             pending.expires_at = expires
             session.add(pending)
         session.commit()
-        _send_whatsapp_reply(cfg, sender_phone, f"{plan.question}\n\nלהמשך השב: כן / לא")
+        _send_whatsapp_confirmation(cfg, sender_phone, plan.question)
         return
 
     if pending is not None:
@@ -1263,5 +1279,25 @@ def _send_whatsapp_reply(cfg: ShopWhatsappConfig, to_phone: str, text: str) -> N
     try:
         send_test_text_message(cfg.access_token, cfg.phone_number_id, to_phone, text[:1900])
     except Exception:
+        log.exception("whatsapp text reply failed shop_id=%s", cfg.shop_id)
         # Don't raise inside webhook path; WhatsApp retries anyway and we avoid 500 loops.
         return
+
+
+def _send_whatsapp_confirmation(cfg: ShopWhatsappConfig, to_phone: str, question: str) -> None:
+    if not cfg.access_token or not cfg.phone_number_id:
+        return
+    try:
+        send_interactive_confirm_buttons(
+            cfg.access_token,
+            cfg.phone_number_id,
+            to_phone,
+            question,
+            yes_id="confirm_yes",
+            no_id="confirm_no",
+        )
+        return
+    except Exception:
+        # Some environments/numbers block interactive messages; fallback to text flow.
+        log.exception("whatsapp interactive send failed shop_id=%s; fallback to text", cfg.shop_id)
+    _send_whatsapp_reply(cfg, to_phone, f"{question}\n\nלהמשך השב: כן / לא")
