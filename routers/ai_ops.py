@@ -231,7 +231,7 @@ async def plan_chat_action(
             on_sale_now = bool(wc_row.get("on_sale"))
             price_field = "regular_price"
             from_price_val = regular_now if regular_now is not None else p.regular_price
-            if on_sale_now:
+            if on_sale_now or (sale_now is not None and sale_now > 0):
                 price_field = "sale_price"
                 from_price_val = effective_now if effective_now is not None else sale_now
             if from_price_val is None:
@@ -332,7 +332,7 @@ async def plan_chat_action(
         on_sale_now = bool(wc_row.get("on_sale"))
         price_field = "regular_price"
         from_price_val = regular_now if regular_now is not None else target.regular_price
-        if on_sale_now:
+        if on_sale_now or (sale_now is not None and sale_now > 0):
             price_field = "sale_price"
             from_price_val = effective_now if effective_now is not None else sale_now
         if from_price_val is None:
@@ -386,7 +386,7 @@ async def plan_chat_action(
         on_sale_now = bool(wc_row.get("on_sale"))
         price_field = "regular_price"
         from_price_val = regular_now if regular_now is not None else target.regular_price
-        if on_sale_now:
+        if on_sale_now or (sale_now is not None and sale_now > 0):
             price_field = "sale_price"
             from_price_val = effective_now if effective_now is not None else sale_now
         if from_price_val is None:
@@ -567,7 +567,9 @@ def confirm_chat_action(
         on_sale_before = bool(row_before.get("on_sale"))
         # If Woo reports active sale, updating regular_price won't change visible price.
         # Force execution path to sale_price to avoid false "executed" responses.
-        if price_field == "regular_price" and on_sale_before:
+        sale_before = before.get("sale_price")
+        has_sale_price_before = sale_before is not None and float(sale_before) > 0
+        if price_field == "regular_price" and (on_sale_before or has_sale_price_before):
             price_field = "sale_price"
             before["price_field"] = "sale_price"
         if price_field == "sale_price":
