@@ -20,6 +20,7 @@ from backend.services.woo_sync import (
     parse_price,
     patch_wc_product_in_stock,
     patch_wc_product_out_of_stock,
+    patch_wc_product_prices,
     patch_wc_product_regular_price,
     patch_wc_product_sale_price,
 )
@@ -460,12 +461,13 @@ def confirm_chat_action(
                 "price_field": price_field,
             }
             if price_field == "sale_price":
-                patch_wc_product_sale_price(
+                patch_wc_product_prices(
                     shop.woo_site_url,
                     shop.woo_consumer_key,
                     shop.woo_consumer_secret,
                     woo_id,
-                    to_price,
+                    regular_price=before.get("regular_price"),
+                    sale_price=to_price,
                 )
             else:
                 patch_wc_product_regular_price(
@@ -559,20 +561,33 @@ def confirm_chat_action(
                     spread = max(float(regular_before) - float(sale_before), 10.0)
                 desired_regular = float(to_price + spread)
                 if regular_before is None or to_price >= float(regular_before):
-                    patch_wc_product_regular_price(
+                    patch_wc_product_prices(
                         shop.woo_site_url,
                         shop.woo_consumer_key,
                         shop.woo_consumer_secret,
                         int(p.woo_product_id),
-                        desired_regular,
+                        regular_price=desired_regular,
+                        sale_price=to_price,
+                        clear_sale_schedule=True,
                     )
-            patch_wc_product_sale_price(
-                shop.woo_site_url,
-                shop.woo_consumer_key,
-                shop.woo_consumer_secret,
-                int(p.woo_product_id),
-                to_price,
-            )
+                else:
+                    patch_wc_product_prices(
+                        shop.woo_site_url,
+                        shop.woo_consumer_key,
+                        shop.woo_consumer_secret,
+                        int(p.woo_product_id),
+                        regular_price=float(regular_before),
+                        sale_price=to_price,
+                        clear_sale_schedule=True,
+                    )
+            else:
+                patch_wc_product_sale_price(
+                    shop.woo_site_url,
+                    shop.woo_consumer_key,
+                    shop.woo_consumer_secret,
+                    int(p.woo_product_id),
+                    to_price,
+                )
         else:
             patch_wc_product_regular_price(
                 shop.woo_site_url,
@@ -596,19 +611,14 @@ def confirm_chat_action(
         if price_field == "sale_price" and action == "increase_price" and not _price_almost_equal(observed, to_price):
             # Last-resort retry: force regular above target, then retry sale update once.
             retry_regular = float(to_price + 10.0)
-            patch_wc_product_regular_price(
+            patch_wc_product_prices(
                 shop.woo_site_url,
                 shop.woo_consumer_key,
                 shop.woo_consumer_secret,
                 int(p.woo_product_id),
-                retry_regular,
-            )
-            patch_wc_product_sale_price(
-                shop.woo_site_url,
-                shop.woo_consumer_key,
-                shop.woo_consumer_secret,
-                int(p.woo_product_id),
-                to_price,
+                regular_price=retry_regular,
+                sale_price=to_price,
+                clear_sale_schedule=True,
             )
             row_after = fetch_wc_product_by_id(
                 shop.woo_site_url,

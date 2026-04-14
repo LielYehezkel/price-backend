@@ -205,6 +205,34 @@ def patch_wc_product_sale_price(
         r.raise_for_status()
 
 
+def patch_wc_product_prices(
+    site_url: str,
+    consumer_key: str,
+    consumer_secret: str,
+    woo_product_id: int,
+    *,
+    regular_price: float | None = None,
+    sale_price: float | None = None,
+    clear_sale_schedule: bool = False,
+) -> None:
+    base = site_url.rstrip("/")
+    url = f"{base}/wp-json/wc/v3/products/{woo_product_id}"
+    params = _wc_auth_params(consumer_key, consumer_secret)
+    body: dict[str, Any] = {}
+    if regular_price is not None:
+        body["regular_price"] = f"{regular_price:.2f}"
+    if sale_price is not None:
+        body["sale_price"] = f"{sale_price:.2f}"
+    if clear_sale_schedule:
+        body["date_on_sale_from"] = None
+        body["date_on_sale_to"] = None
+    if not body:
+        return
+    with httpx.Client(timeout=30.0, follow_redirects=True) as client:
+        r = client.put(url, params=params, json=body)
+        r.raise_for_status()
+
+
 def patch_wc_product_out_of_stock(
     site_url: str,
     consumer_key: str,
