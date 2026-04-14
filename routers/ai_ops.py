@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import secrets
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -27,6 +27,14 @@ from backend.services.whatsapp_cloud import send_interactive_confirm_buttons, se
 
 router = APIRouter(prefix="/api/shops", tags=["ai-ops"])
 log = logging.getLogger(__name__)
+
+
+def _as_utc_aware(dt: datetime | None) -> datetime | None:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 
 class ChatPlanIn(BaseModel):
@@ -104,7 +112,7 @@ def _log_ai_action(
     payload: dict[str, Any],
     product_id: int | None = None,
 ) -> ShopAiActionLog:
-    now = utcnow()
+    now = _as_utc_aware(utcnow()) or utcnow()
     row = ShopAiActionLog(
         shop_id=shop_id,
         user_id=user_id,
@@ -668,7 +676,8 @@ def undo_ai_action(
         raise HTTPException(404, "פעולה לא נמצאה")
     if row.status != "executed":
         raise HTTPException(400, "הפעולה לא ניתנת לביטול")
-    if row.undo_deadline_at is None or utcnow() > row.undo_deadline_at:
+    deadline = _as_utc_aware(row.undo_deadline_at)
+    if deadline is None or _as_utc_aware(utcnow()) > deadline:
         row.status = "undo_expired"
         row.undo_note = "window expired"
         session.add(row)
@@ -1197,7 +1206,8 @@ async def _process_whatsapp_text_message(
             ShopWhatsappPendingAction.sender_phone == sender_phone,
         ),
     ).first()
-    if pending and pending.expires_at < now:
+    pending_expires_at = _as_utc_aware(pending.expires_at) if pending else None
+    if pending and pending_expires_at and pending_expires_at < now:
         session.delete(pending)
         session.commit()
         pending = None
