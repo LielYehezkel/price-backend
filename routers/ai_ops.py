@@ -547,18 +547,19 @@ def confirm_chat_action(
             if action == "increase_price":
                 regular_before = before.get("regular_price")
                 sale_before = before.get("sale_price")
-                if (
-                    regular_before is not None
-                    and sale_before is not None
-                    and to_price >= float(regular_before)
-                ):
-                    spread = max(float(regular_before) - float(sale_before), 0.01)
+                # Woo may refuse/ignore sale updates when regular is missing or <= sale.
+                # Keep a small spread so sale remains a valid "discount" price.
+                spread = 10.0
+                if regular_before is not None and sale_before is not None:
+                    spread = max(float(regular_before) - float(sale_before), 10.0)
+                desired_regular = float(to_price + spread)
+                if regular_before is None or to_price >= float(regular_before):
                     patch_wc_product_regular_price(
                         shop.woo_site_url,
                         shop.woo_consumer_key,
                         shop.woo_consumer_secret,
                         int(p.woo_product_id),
-                        float(to_price + spread),
+                        desired_regular,
                     )
             patch_wc_product_sale_price(
                 shop.woo_site_url,
@@ -587,6 +588,32 @@ def confirm_chat_action(
         after_regular = parse_price(row_after.get("regular_price"))
         after_sale = parse_price(row_after.get("sale_price"))
         observed = after_sale if price_field == "sale_price" else after_regular
+        if price_field == "sale_price" and action == "increase_price" and not _price_almost_equal(observed, to_price):
+            # Last-resort retry: force regular above target, then retry sale update once.
+            retry_regular = float(to_price + 10.0)
+            patch_wc_product_regular_price(
+                shop.woo_site_url,
+                shop.woo_consumer_key,
+                shop.woo_consumer_secret,
+                int(p.woo_product_id),
+                retry_regular,
+            )
+            patch_wc_product_sale_price(
+                shop.woo_site_url,
+                shop.woo_consumer_key,
+                shop.woo_consumer_secret,
+                int(p.woo_product_id),
+                to_price,
+            )
+            row_after = fetch_wc_product_by_id(
+                shop.woo_site_url,
+                shop.woo_consumer_key,
+                shop.woo_consumer_secret,
+                int(p.woo_product_id),
+            )
+            after_regular = parse_price(row_after.get("regular_price"))
+            after_sale = parse_price(row_after.get("sale_price"))
+            observed = after_sale
         if not _price_almost_equal(observed, to_price):
             raise HTTPException(
                 409,
