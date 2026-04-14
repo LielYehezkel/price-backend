@@ -36,6 +36,10 @@ class Shop(SQLModel, table=True):
     owner_id: int = Field(foreign_key="user.id")
     check_interval_hours: int = Field(default=6)  # legacy; prefer check_interval_minutes
     check_interval_minutes: int = Field(default=360)  # default = 6h; min 1 for testing
+    package_tier: str = Field(default="free", index=True)  # free | basic | premium
+    package_max_scan_runs_per_day: int = Field(default=10)
+    package_max_scans_per_day_window: int = Field(default=1)
+    package_min_interval_minutes: int = Field(default=1440)
     # מחזור סריקה מלא (כל קישורי המתחרה ברצף) — מתעדכן בסיום כל ריצה
     last_scan_cycle_at: Optional[datetime] = None
     woo_site_url: Optional[str] = None
@@ -375,3 +379,15 @@ class ShopSalesNotificationLog(SQLModel, table=True):
     event_kind: str = Field(index=True)  # sale_live | daily_report | monthly_report
     event_key: str = Field(index=True)  # order_id or YYYY-MM-DD or YYYY-MM
     sent_at: datetime = Field(default_factory=utcnow, index=True)
+
+
+class ShopScanQuotaDaily(SQLModel, table=True):
+    """Per-shop daily quota usage for scheduler package enforcement."""
+
+    __table_args__ = (UniqueConstraint("shop_id", "bucket_date", name="uq_shop_scan_quota_daily"),)
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    shop_id: int = Field(foreign_key="shop.id", index=True)
+    bucket_date: str = Field(index=True, max_length=10)  # YYYY-MM-DD (UTC)
+    runs_count: int = Field(default=0)
+    updated_at: datetime = Field(default_factory=utcnow)

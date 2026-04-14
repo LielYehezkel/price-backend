@@ -398,7 +398,16 @@ def create_shop(
     session: Annotated[Session, Depends(get_session)],
     user: Annotated[User, Depends(get_current_user)],
 ):
-    shop = Shop(name=body.name, owner_id=user.id)
+    shop = Shop(
+        name=body.name,
+        owner_id=user.id,
+        package_tier="free",
+        package_max_scan_runs_per_day=10,
+        package_max_scans_per_day_window=1,
+        package_min_interval_minutes=1440,
+        check_interval_minutes=1440,
+        check_interval_hours=24,
+    )
     session.add(shop)
     session.commit()
     session.refresh(shop)
@@ -429,18 +438,11 @@ def patch_shop(
     shop = require_shop_access(session, user, shop_id)
     if body.name is not None:
         shop.name = body.name
-    if body.check_interval_minutes is not None:
-        m = max(1, min(body.check_interval_minutes, 60 * 24 * 14))
-        if m != getattr(shop, "check_interval_minutes", None):
-            shop.last_scan_cycle_at = None
-        shop.check_interval_minutes = m
-        shop.check_interval_hours = max(1, (m + 59) // 60)
-    elif body.check_interval_hours is not None:
-        shop.check_interval_hours = max(1, body.check_interval_hours)
-        new_m = max(1, shop.check_interval_hours * 60)
-        if new_m != getattr(shop, "check_interval_minutes", None):
-            shop.last_scan_cycle_at = None
-        shop.check_interval_minutes = new_m
+    if body.check_interval_minutes is not None or body.check_interval_hours is not None:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "תזמוני סריקה מנוהלים רק דרך פאנל הניהול וחבילת החנות.",
+        )
     session.add(shop)
     session.commit()
     session.refresh(shop)

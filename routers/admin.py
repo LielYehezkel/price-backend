@@ -20,6 +20,7 @@ from backend.models import (
     ScanLog,
     SchedulerHeartbeat,
     Shop,
+    ShopScanQuotaDaily,
     User,
     utcnow,
 )
@@ -82,6 +83,27 @@ from backend.routers.price import ResolveOut, run_price_resolve
 router = APIRouter(prefix="/api/admin", tags=["admin"])
 
 
+PACKAGE_POLICIES: dict[str, dict[str, int]] = {
+    "free": {"max_scan_runs_per_day": 10, "max_scans_per_day_window": 1, "min_interval_minutes": 1440},
+    "basic": {"max_scan_runs_per_day": 50, "max_scans_per_day_window": 2, "min_interval_minutes": 720},
+    "premium": {"max_scan_runs_per_day": 250, "max_scans_per_day_window": 3, "min_interval_minutes": 480},
+}
+
+
+def apply_package_policy(shop: Shop, package_tier: str) -> None:
+    tier = (package_tier or "").strip().lower()
+    policy = PACKAGE_POLICIES.get(tier)
+    if not policy:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "חבילה לא תקינה")
+    shop.package_tier = tier
+    shop.package_max_scan_runs_per_day = int(policy["max_scan_runs_per_day"])
+    shop.package_max_scans_per_day_window = int(policy["max_scans_per_day_window"])
+    shop.package_min_interval_minutes = int(policy["min_interval_minutes"])
+    # Keep legacy fields aligned with package scheduler policy.
+    shop.check_interval_minutes = int(policy["min_interval_minutes"])
+    shop.check_interval_hours = max(1, int((shop.check_interval_minutes + 59) // 60))
+
+
 class UserAdminRow(BaseModel):
     id: int
     email: str
@@ -89,6 +111,21 @@ class UserAdminRow(BaseModel):
     is_admin: bool
     created_at: str
     password_note: str
+
+
+class AdminShopPackageRow(BaseModel):
+    shop_id: int
+    shop_name: str
+    owner_email: str | None
+    package_tier: str
+    package_max_scan_runs_per_day: int
+    package_max_scans_per_day_window: int
+    package_min_interval_minutes: int
+    today_runs_used: int
+
+
+class AdminShopPackagePatch(BaseModel):
+    package_tier: str
 
 
 class UserAdminPatch(BaseModel):
@@ -170,6 +207,72 @@ def set_user_password(
     session.add(u)
     session.commit()
     return {"ok": True}
+
+
+@router.get("/shops/packages", response_model=list[AdminShopPackageRow])
+def list_shop_packages(
+    session: Annotated[Session, Depends(get_session)],
+    _admin: Annotated[User, Depends(get_current_admin)],
+):
+    today = utcnow().strftime("%Y-%m-%d")
+    shops = session.exec(select(Shop).order_by(Shop.id)).all()
+    out: list[AdminShopPackageRow] = []
+    for s in shops:
+        owner = session.get(User, s.owner_id)
+        q = session.exec(
+            select(ShopScanQuotaDaily).where(
+                ShopScanQuotaDaily.shop_id == int(s.id),
+                ShopScanQuotaDaily.bucket_date == today,
+            ),
+        ).first()
+        out.append(
+            AdminShopPackageRow(
+                shop_id=int(s.id or 0),
+                shop_name=s.name,
+                owner_email=owner.email if owner else None,
+                package_tier=(getattr(s, "package_tier", None) or "free"),
+                package_max_scan_runs_per_day=int(getattr(s, "package_max_scan_runs_per_day", 10) or 10),
+                package_max_scans_per_day_window=int(getattr(s, "package_max_scans_per_day_window", 1) or 1),
+                package_min_interval_minutes=int(getattr(s, "package_min_interval_minutes", 1440) or 1440),
+                today_runs_used=int(getattr(q, "runs_count", 0) or 0),
+            ),
+        )
+    return out
+
+
+@router.patch("/shops/{shop_id}/package", response_model=AdminShopPackageRow)
+def patch_shop_package(
+    shop_id: int,
+    body: AdminShopPackagePatch,
+    session: Annotated[Session, Depends(get_session)],
+    _admin: Annotated[User, Depends(get_current_admin)],
+):
+    s = session.get(Shop, shop_id)
+    if not s:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "חנות לא נמצאה")
+    apply_package_policy(s, body.package_tier)
+    s.last_scan_cycle_at = None
+    session.add(s)
+    session.commit()
+    session.refresh(s)
+    owner = session.get(User, s.owner_id)
+    today = utcnow().strftime("%Y-%m-%d")
+    q = session.exec(
+        select(ShopScanQuotaDaily).where(
+            ShopScanQuotaDaily.shop_id == int(s.id),
+            ShopScanQuotaDaily.bucket_date == today,
+        ),
+    ).first()
+    return AdminShopPackageRow(
+        shop_id=int(s.id or 0),
+        shop_name=s.name,
+        owner_email=owner.email if owner else None,
+        package_tier=s.package_tier,
+        package_max_scan_runs_per_day=int(s.package_max_scan_runs_per_day or 10),
+        package_max_scans_per_day_window=int(s.package_max_scans_per_day_window or 1),
+        package_min_interval_minutes=int(s.package_min_interval_minutes or 1440),
+        today_runs_used=int(getattr(q, "runs_count", 0) or 0),
+    )
 
 
 def _parse_candidates_json(raw_json: str | None) -> list[dict[str, Any]]:

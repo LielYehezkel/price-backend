@@ -61,6 +61,80 @@ def _migrate_shop_last_scan_cycle_at() -> None:
                 log.warning("Migration failed: shop.last_scan_cycle_at: %s", ex)
 
 
+def _migrate_shop_packages() -> None:
+    cols = [
+        ("package_tier", "VARCHAR DEFAULT 'free'"),
+        ("package_max_scan_runs_per_day", "INTEGER DEFAULT 10"),
+        ("package_max_scans_per_day_window", "INTEGER DEFAULT 1"),
+        ("package_min_interval_minutes", "INTEGER DEFAULT 1440"),
+    ]
+    for name, typ in cols:
+        with engine.begin() as conn:
+            try:
+                conn.execute(text(f"ALTER TABLE shop ADD COLUMN {name} {typ}"))
+            except Exception as ex:
+                if not _is_duplicate_column_error(ex):
+                    log.warning("Migration failed: shop.%s: %s", name, ex)
+    with engine.begin() as conn:
+        try:
+            conn.execute(text("UPDATE shop SET package_tier = 'free' WHERE package_tier IS NULL OR package_tier = ''"))
+            conn.execute(
+                text(
+                    "UPDATE shop SET package_max_scan_runs_per_day = 10 "
+                    "WHERE package_max_scan_runs_per_day IS NULL OR package_max_scan_runs_per_day < 1",
+                ),
+            )
+            conn.execute(
+                text(
+                    "UPDATE shop SET package_max_scans_per_day_window = 1 "
+                    "WHERE package_max_scans_per_day_window IS NULL OR package_max_scans_per_day_window < 1",
+                ),
+            )
+            conn.execute(
+                text(
+                    "UPDATE shop SET package_min_interval_minutes = 1440 "
+                    "WHERE package_min_interval_minutes IS NULL OR package_min_interval_minutes < 1",
+                ),
+            )
+        except Exception as ex:
+            log.warning("Migration failed: shop package backfill: %s", ex)
+
+
+def _migrate_shop_scan_quota_daily() -> None:
+    with engine.begin() as conn:
+        try:
+            conn.execute(
+                text(
+                    "CREATE TABLE shopscanquotadaily ("
+                    "id INTEGER PRIMARY KEY, "
+                    "shop_id INTEGER REFERENCES shop(id), "
+                    "bucket_date VARCHAR(10), "
+                    "runs_count INTEGER DEFAULT 0, "
+                    "updated_at TIMESTAMP"
+                    ")",
+                ),
+            )
+        except Exception as ex:
+            msg = str(ex).lower()
+            if "already exists" not in msg and "duplicate" not in msg:
+                log.warning("Migration failed: create shopscanquotadaily: %s", ex)
+    with engine.begin() as conn:
+        try:
+            conn.execute(text("CREATE UNIQUE INDEX uq_shop_scan_quota_daily ON shopscanquotadaily(shop_id, bucket_date)"))
+        except Exception:
+            pass
+    with engine.begin() as conn:
+        try:
+            conn.execute(text("CREATE INDEX ix_shopscanquotadaily_shop_id ON shopscanquotadaily(shop_id)"))
+        except Exception:
+            pass
+    with engine.begin() as conn:
+        try:
+            conn.execute(text("CREATE INDEX ix_shopscanquotadaily_bucket_date ON shopscanquotadaily(bucket_date)"))
+        except Exception:
+            pass
+
+
 def _migrate_shop_check_interval_minutes() -> None:
     with engine.begin() as conn:
         try:
@@ -356,6 +430,8 @@ def init_db() -> None:
     # חייב לפני כל שאילתת ORM על shop/product/competitorlink עם עמודות חדשות
     _migrate_shop_setup_and_pricing_strategy()
     _migrate_shop_woo_currency()
+    _migrate_shop_packages()
+    _migrate_shop_scan_quota_daily()
     _migrate_product_extended()
     _migrate_shop_last_scan_cycle_at()
     _migrate_shop_check_interval_minutes()

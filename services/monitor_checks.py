@@ -18,6 +18,7 @@ from backend.models import (
     Product,
     ScanLog,
     Shop,
+    ShopScanQuotaDaily,
     utcnow,
 )
 from backend.services.auto_pricing import maybe_apply_auto_pricing
@@ -424,7 +425,9 @@ def run_competitor_check(session: Session, competitor_id: int) -> CompetitorChec
 
 
 def _shop_interval_minutes(shop: Shop) -> int:
-    mins = getattr(shop, "check_interval_minutes", None)
+    mins = getattr(shop, "package_min_interval_minutes", None)
+    if mins is None or mins < 1:
+        mins = getattr(shop, "check_interval_minutes", None)
     if mins is None or mins < 1:
         mins = max(1, (shop.check_interval_hours or 6) * 60)
     return max(1, int(mins))
@@ -442,6 +445,44 @@ def _shop_scan_cycle_due(shop: Shop, now: datetime) -> bool:
     return (now - lc) >= interval
 
 
+def _daily_quota_key(now: datetime) -> str:
+    n = _aware(now) or now
+    return n.astimezone(timezone.utc).strftime("%Y-%m-%d")
+
+
+def _get_or_create_daily_quota(session: Session, shop_id: int, bucket_date: str) -> ShopScanQuotaDaily:
+    row = session.exec(
+        select(ShopScanQuotaDaily).where(
+            ShopScanQuotaDaily.shop_id == shop_id,
+            ShopScanQuotaDaily.bucket_date == bucket_date,
+        ),
+    ).first()
+    if row:
+        return row
+    row = ShopScanQuotaDaily(shop_id=shop_id, bucket_date=bucket_date, runs_count=0, updated_at=utcnow())
+    session.add(row)
+    session.commit()
+    session.refresh(row)
+    return row
+
+
+def _shop_daily_quota_exceeded(session: Session, shop: Shop, now: datetime) -> bool:
+    max_runs = int(getattr(shop, "package_max_scan_runs_per_day", 10) or 10)
+    max_runs = max(1, max_runs)
+    bucket = _daily_quota_key(now)
+    row = _get_or_create_daily_quota(session, int(shop.id), bucket)
+    return int(row.runs_count or 0) >= max_runs
+
+
+def _increment_shop_daily_quota(session: Session, shop: Shop, now: datetime) -> None:
+    bucket = _daily_quota_key(now)
+    row = _get_or_create_daily_quota(session, int(shop.id), bucket)
+    row.runs_count = int(row.runs_count or 0) + 1
+    row.updated_at = utcnow()
+    session.add(row)
+    session.commit()
+
+
 def run_scheduled_checks(session: Session) -> tuple[int, int]:
     """
     לכל חנות שהגיע זמן מחזור: מריצים את **כל** קישורי המתחרה ברצף (מיד אחד אחרי השני).
@@ -453,8 +494,25 @@ def run_scheduled_checks(session: Session) -> tuple[int, int]:
     shops = session.exec(select(Shop).order_by(Shop.id)).all()
     total = 0
     shops_touched = 0
+    skipped_interval_not_due = 0
+    skipped_quota_exceeded = 0
     for shop in shops:
         if not _shop_scan_cycle_due(shop, now):
+            skipped_interval_not_due += 1
+            continue
+        if _shop_daily_quota_exceeded(session, shop, now):
+            skipped_quota_exceeded += 1
+            append_operational_log_safe(
+                level="info",
+                code="package_quota_exceeded",
+                title="חנות דולגה — מכסת סריקות יומית הושלמה",
+                detail=(
+                    f"shop_id={shop.id} tier={getattr(shop, 'package_tier', 'free')} "
+                    f"max_runs_per_day={getattr(shop, 'package_max_scan_runs_per_day', 10)}"
+                ),
+                shop_id=shop.id,
+                competitor_link_id=None,
+            )
             continue
 
         shops_touched += 1
@@ -497,5 +555,19 @@ def run_scheduled_checks(session: Session) -> tuple[int, int]:
         session.add(shop)
         session.commit()
         session.refresh(shop)
+        _increment_shop_daily_quota(session, shop, now)
+
+    if skipped_interval_not_due or skipped_quota_exceeded:
+        append_operational_log_safe(
+            level="info",
+            code="package_cycle_skip_summary",
+            title="דילוגי סריקה לפי מדיניות חבילות",
+            detail=(
+                f"interval_not_due={skipped_interval_not_due} "
+                f"quota_exceeded={skipped_quota_exceeded}"
+            ),
+            shop_id=None,
+            competitor_link_id=None,
+        )
 
     return total, shops_touched
