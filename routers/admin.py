@@ -20,6 +20,7 @@ from backend.models import (
     ScanLog,
     SchedulerHeartbeat,
     Shop,
+    ShopPackageAuditLog,
     ShopScanQuotaDaily,
     User,
     utcnow,
@@ -38,6 +39,7 @@ from backend.services.fetch_html import (
 )
 from backend.services.monitor_checks import run_competitor_check
 from backend.services.scan_engine_journal import compute_scan_engine_health, get_or_create_heartbeat
+from backend.services.scan_engine_journal import append_operational_log_safe
 from backend.services.system_config import get_or_create_system_config
 
 
@@ -121,11 +123,29 @@ class AdminShopPackageRow(BaseModel):
     package_max_scan_runs_per_day: int
     package_max_scans_per_day_window: int
     package_min_interval_minutes: int
+    package_usage_metric: str
     today_runs_used: int
 
 
 class AdminShopPackagePatch(BaseModel):
     package_tier: str
+    change_note: str | None = None
+
+
+class AdminShopPackageAuditRow(BaseModel):
+    id: int
+    shop_id: int
+    changed_by_user_id: int
+    previous_tier: str
+    new_tier: str
+    previous_max_scan_runs_per_day: int
+    new_max_scan_runs_per_day: int
+    previous_max_scans_per_day_window: int
+    new_max_scans_per_day_window: int
+    previous_min_interval_minutes: int
+    new_min_interval_minutes: int
+    change_note: str | None
+    created_at: str
 
 
 class UserAdminPatch(BaseModel):
@@ -234,6 +254,7 @@ def list_shop_packages(
                 package_max_scan_runs_per_day=int(getattr(s, "package_max_scan_runs_per_day", 10) or 10),
                 package_max_scans_per_day_window=int(getattr(s, "package_max_scans_per_day_window", 1) or 1),
                 package_min_interval_minutes=int(getattr(s, "package_min_interval_minutes", 1440) or 1440),
+                package_usage_metric="shop_scan_cycle_runs_per_day",
                 today_runs_used=int(getattr(q, "runs_count", 0) or 0),
             ),
         )
@@ -249,10 +270,57 @@ def patch_shop_package(
 ):
     s = session.get(Shop, shop_id)
     if not s:
+        append_operational_log_safe(
+            level="warning",
+            code="PACKAGE_PATCH_SHOP_NOT_FOUND",
+            title="ניסיון שינוי חבילה לחנות לא קיימת",
+            detail=f"shop_id={shop_id}",
+            shop_id=None,
+            competitor_link_id=None,
+        )
         raise HTTPException(status.HTTP_404_NOT_FOUND, "חנות לא נמצאה")
-    apply_package_policy(s, body.package_tier)
+    prev = {
+        "tier": getattr(s, "package_tier", "free") or "free",
+        "max_runs": int(getattr(s, "package_max_scan_runs_per_day", 10) or 10),
+        "windows": int(getattr(s, "package_max_scans_per_day_window", 1) or 1),
+        "interval": int(getattr(s, "package_min_interval_minutes", 1440) or 1440),
+    }
+    try:
+        apply_package_policy(s, body.package_tier)
+    except HTTPException:
+        append_operational_log_safe(
+            level="warning",
+            code="PACKAGE_PATCH_INVALID_TIER",
+            title="ניסיון שינוי חבילה עם tier לא תקין",
+            detail=f"shop_id={shop_id} requested_tier={(body.package_tier or '').strip().lower()}",
+            shop_id=shop_id,
+            competitor_link_id=None,
+        )
+        raise
     s.last_scan_cycle_at = None
     session.add(s)
+    changed = (
+        s.package_tier != prev["tier"]
+        or int(s.package_max_scan_runs_per_day or 0) != prev["max_runs"]
+        or int(s.package_max_scans_per_day_window or 0) != prev["windows"]
+        or int(s.package_min_interval_minutes or 0) != prev["interval"]
+    )
+    if changed:
+        session.add(
+            ShopPackageAuditLog(
+                shop_id=int(s.id),
+                changed_by_user_id=int(_admin.id),
+                previous_tier=prev["tier"],
+                new_tier=s.package_tier,
+                previous_max_scan_runs_per_day=prev["max_runs"],
+                new_max_scan_runs_per_day=int(s.package_max_scan_runs_per_day or 10),
+                previous_max_scans_per_day_window=prev["windows"],
+                new_max_scans_per_day_window=int(s.package_max_scans_per_day_window or 1),
+                previous_min_interval_minutes=prev["interval"],
+                new_min_interval_minutes=int(s.package_min_interval_minutes or 1440),
+                change_note=(body.change_note or "").strip() or None,
+            ),
+        )
     session.commit()
     session.refresh(s)
     owner = session.get(User, s.owner_id)
@@ -271,8 +339,42 @@ def patch_shop_package(
         package_max_scan_runs_per_day=int(s.package_max_scan_runs_per_day or 10),
         package_max_scans_per_day_window=int(s.package_max_scans_per_day_window or 1),
         package_min_interval_minutes=int(s.package_min_interval_minutes or 1440),
+        package_usage_metric="shop_scan_cycle_runs_per_day",
         today_runs_used=int(getattr(q, "runs_count", 0) or 0),
     )
+
+
+@router.get("/shops/{shop_id}/package-audit", response_model=list[AdminShopPackageAuditRow])
+def list_shop_package_audit(
+    shop_id: int,
+    session: Annotated[Session, Depends(get_session)],
+    _admin: Annotated[User, Depends(get_current_admin)],
+    limit: int = Query(100, ge=1, le=500),
+):
+    rows = session.exec(
+        select(ShopPackageAuditLog)
+        .where(ShopPackageAuditLog.shop_id == shop_id)
+        .order_by(ShopPackageAuditLog.id.desc())
+        .limit(limit),
+    ).all()
+    return [
+        AdminShopPackageAuditRow(
+            id=int(r.id or 0),
+            shop_id=int(r.shop_id),
+            changed_by_user_id=int(r.changed_by_user_id),
+            previous_tier=r.previous_tier,
+            new_tier=r.new_tier,
+            previous_max_scan_runs_per_day=int(r.previous_max_scan_runs_per_day),
+            new_max_scan_runs_per_day=int(r.new_max_scan_runs_per_day),
+            previous_max_scans_per_day_window=int(r.previous_max_scans_per_day_window),
+            new_max_scans_per_day_window=int(r.new_max_scans_per_day_window),
+            previous_min_interval_minutes=int(r.previous_min_interval_minutes),
+            new_min_interval_minutes=int(r.new_min_interval_minutes),
+            change_note=r.change_note,
+            created_at=r.created_at.isoformat(),
+        )
+        for r in rows
+    ]
 
 
 def _parse_candidates_json(raw_json: str | None) -> list[dict[str, Any]]:

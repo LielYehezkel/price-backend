@@ -391,3 +391,21 @@ class ShopScanQuotaDaily(SQLModel, table=True):
     bucket_date: str = Field(index=True, max_length=10)  # YYYY-MM-DD (UTC)
     runs_count: int = Field(default=0)
     updated_at: datetime = Field(default_factory=utcnow)
+
+
+class ShopPackageAuditLog(SQLModel, table=True):
+    """Immutable audit trail for package tier/policy changes."""
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    shop_id: int = Field(foreign_key="shop.id", index=True)
+    changed_by_user_id: int = Field(foreign_key="user.id", index=True)
+    previous_tier: str = Field(default="free", index=True)
+    new_tier: str = Field(default="free", index=True)
+    previous_max_scan_runs_per_day: int = Field(default=10)
+    new_max_scan_runs_per_day: int = Field(default=10)
+    previous_max_scans_per_day_window: int = Field(default=1)
+    new_max_scans_per_day_window: int = Field(default=1)
+    previous_min_interval_minutes: int = Field(default=1440)
+    new_min_interval_minutes: int = Field(default=1440)
+    change_note: Optional[str] = None
+    created_at: datetime = Field(default_factory=utcnow, index=True)

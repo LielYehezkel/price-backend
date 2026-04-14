@@ -135,6 +135,49 @@ def _migrate_shop_scan_quota_daily() -> None:
             pass
 
 
+def _migrate_shop_package_audit_log() -> None:
+    with engine.begin() as conn:
+        try:
+            conn.execute(
+                text(
+                    "CREATE TABLE shoppackageauditlog ("
+                    "id INTEGER PRIMARY KEY, "
+                    "shop_id INTEGER REFERENCES shop(id), "
+                    'changed_by_user_id INTEGER REFERENCES "user"(id), '
+                    "previous_tier VARCHAR DEFAULT 'free', "
+                    "new_tier VARCHAR DEFAULT 'free', "
+                    "previous_max_scan_runs_per_day INTEGER DEFAULT 10, "
+                    "new_max_scan_runs_per_day INTEGER DEFAULT 10, "
+                    "previous_max_scans_per_day_window INTEGER DEFAULT 1, "
+                    "new_max_scans_per_day_window INTEGER DEFAULT 1, "
+                    "previous_min_interval_minutes INTEGER DEFAULT 1440, "
+                    "new_min_interval_minutes INTEGER DEFAULT 1440, "
+                    "change_note VARCHAR, "
+                    "created_at TIMESTAMP"
+                    ")",
+                ),
+            )
+        except Exception as ex:
+            msg = str(ex).lower()
+            if "already exists" not in msg and "duplicate" not in msg:
+                log.warning("Migration failed: create shoppackageauditlog: %s", ex)
+    with engine.begin() as conn:
+        try:
+            conn.execute(text("CREATE INDEX ix_shoppackageauditlog_shop_id ON shoppackageauditlog(shop_id)"))
+        except Exception:
+            pass
+    with engine.begin() as conn:
+        try:
+            conn.execute(text("CREATE INDEX ix_shoppackageauditlog_changed_by ON shoppackageauditlog(changed_by_user_id)"))
+        except Exception:
+            pass
+    with engine.begin() as conn:
+        try:
+            conn.execute(text("CREATE INDEX ix_shoppackageauditlog_created_at ON shoppackageauditlog(created_at)"))
+        except Exception:
+            pass
+
+
 def _migrate_shop_check_interval_minutes() -> None:
     with engine.begin() as conn:
         try:
@@ -432,6 +475,7 @@ def init_db() -> None:
     _migrate_shop_woo_currency()
     _migrate_shop_packages()
     _migrate_shop_scan_quota_daily()
+    _migrate_shop_package_audit_log()
     _migrate_product_extended()
     _migrate_shop_last_scan_cycle_at()
     _migrate_shop_check_interval_minutes()

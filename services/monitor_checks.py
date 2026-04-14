@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 import httpx
+from sqlalchemy import text
 from sqlmodel import Session, select
 
 from backend.models import (
@@ -451,18 +452,24 @@ def _daily_quota_key(now: datetime) -> str:
 
 
 def _get_or_create_daily_quota(session: Session, shop_id: int, bucket_date: str) -> ShopScanQuotaDaily:
+    # Multi-instance safe "ensure row exists" (works on PostgreSQL and SQLite).
+    session.execute(
+        text(
+            "INSERT INTO shopscanquotadaily(shop_id, bucket_date, runs_count, updated_at) "
+            "VALUES (:shop_id, :bucket_date, 0, :updated_at) "
+            "ON CONFLICT(shop_id, bucket_date) DO NOTHING",
+        ),
+        {"shop_id": shop_id, "bucket_date": bucket_date, "updated_at": utcnow()},
+    )
+    session.commit()
     row = session.exec(
         select(ShopScanQuotaDaily).where(
             ShopScanQuotaDaily.shop_id == shop_id,
             ShopScanQuotaDaily.bucket_date == bucket_date,
         ),
     ).first()
-    if row:
-        return row
-    row = ShopScanQuotaDaily(shop_id=shop_id, bucket_date=bucket_date, runs_count=0, updated_at=utcnow())
-    session.add(row)
-    session.commit()
-    session.refresh(row)
+    if not row:
+        raise RuntimeError("failed to ensure daily quota row")
     return row
 
 
@@ -483,6 +490,36 @@ def _increment_shop_daily_quota(session: Session, shop: Shop, now: datetime) -> 
     session.commit()
 
 
+def _try_consume_shop_daily_quota(session: Session, shop: Shop, now: datetime) -> tuple[bool, int, int]:
+    """
+    Atomically consume one run slot if available.
+    Returns (consumed, used_after, max_runs).
+    """
+    max_runs = int(getattr(shop, "package_max_scan_runs_per_day", 10) or 10)
+    max_runs = max(1, max_runs)
+    bucket = _daily_quota_key(now)
+    _get_or_create_daily_quota(session, int(shop.id), bucket)
+    # Atomic guard across multiple workers/instances.
+    upd = session.execute(
+        text(
+            "UPDATE shopscanquotadaily "
+            "SET runs_count = runs_count + 1, updated_at = :updated_at "
+            "WHERE shop_id = :shop_id AND bucket_date = :bucket_date AND runs_count < :max_runs",
+        ),
+        {"updated_at": utcnow(), "shop_id": int(shop.id), "bucket_date": bucket, "max_runs": max_runs},
+    )
+    session.commit()
+    consumed = bool(getattr(upd, "rowcount", 0))
+    row = session.exec(
+        select(ShopScanQuotaDaily).where(
+            ShopScanQuotaDaily.shop_id == int(shop.id),
+            ShopScanQuotaDaily.bucket_date == bucket,
+        ),
+    ).first()
+    used_after = int(getattr(row, "runs_count", 0) or 0)
+    return consumed, used_after, max_runs
+
+
 def run_scheduled_checks(session: Session) -> tuple[int, int]:
     """
     לכל חנות שהגיע זמן מחזור: מריצים את **כל** קישורי המתחרה ברצף (מיד אחד אחרי השני).
@@ -500,7 +537,8 @@ def run_scheduled_checks(session: Session) -> tuple[int, int]:
         if not _shop_scan_cycle_due(shop, now):
             skipped_interval_not_due += 1
             continue
-        if _shop_daily_quota_exceeded(session, shop, now):
+        consumed_slot, used_after, max_runs = _try_consume_shop_daily_quota(session, shop, now)
+        if not consumed_slot:
             skipped_quota_exceeded += 1
             append_operational_log_safe(
                 level="info",
@@ -508,14 +546,42 @@ def run_scheduled_checks(session: Session) -> tuple[int, int]:
                 title="חנות דולגה — מכסת סריקות יומית הושלמה",
                 detail=(
                     f"shop_id={shop.id} tier={getattr(shop, 'package_tier', 'free')} "
-                    f"max_runs_per_day={getattr(shop, 'package_max_scan_runs_per_day', 10)}"
+                    f"max_runs_per_day={max_runs} used={used_after}"
                 ),
                 shop_id=shop.id,
                 competitor_link_id=None,
             )
             continue
+        if max_runs > 0 and used_after >= max(1, int(max_runs * 0.8)):
+            append_operational_log_safe(
+                level="info",
+                code="package_quota_nearing_limit",
+                title="חנות מתקרבת למכסה יומית",
+                detail=(
+                    f"shop_id={shop.id} tier={getattr(shop, 'package_tier', 'free')} "
+                    f"usage={used_after}/{max_runs}"
+                ),
+                shop_id=shop.id,
+                competitor_link_id=None,
+            )
 
         shops_touched += 1
+        last_cycle = _aware(getattr(shop, "last_scan_cycle_at", None))
+        interval_minutes = _shop_interval_minutes(shop)
+        if last_cycle is not None:
+            drift_minutes = int((now - last_cycle).total_seconds() // 60) - interval_minutes
+            if drift_minutes > max(5, interval_minutes // 2):
+                append_operational_log_safe(
+                    level="warning",
+                    code="package_cadence_drift",
+                    title="חריגה בקצב מחזור הסריקות",
+                    detail=(
+                        f"shop_id={shop.id} tier={getattr(shop, 'package_tier', 'free')} "
+                        f"expected_interval_minutes={interval_minutes} drift_minutes={drift_minutes}"
+                    ),
+                    shop_id=shop.id,
+                    competitor_link_id=None,
+                )
         links = session.exec(
             select(CompetitorLink)
             .join(Product, CompetitorLink.product_id == Product.id)
@@ -555,7 +621,6 @@ def run_scheduled_checks(session: Session) -> tuple[int, int]:
         session.add(shop)
         session.commit()
         session.refresh(shop)
-        _increment_shop_daily_quota(session, shop, now)
 
     if skipped_interval_not_due or skipped_quota_exceeded:
         append_operational_log_safe(
