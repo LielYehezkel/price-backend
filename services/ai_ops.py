@@ -34,6 +34,26 @@ _HE_NUM_WORDS = {
     "עשרה": "10",
 }
 
+_SEMANTIC_REWRITES: list[tuple[str, str]] = [
+    (r"\bמערכת ישיבה\b", "ישיבה"),
+    (r"\bפינת ישיבה\b", "ישיבה"),
+    (r"\bסלון\b", "ישיבה"),
+    (r"\bספה\b", "ישיבה"),
+    (r"\bכורסה\b", "ישיבה"),
+]
+
+_REDUCE_KEYWORDS = (
+    "תוריד את המחיר",
+    "הורד מחיר",
+    "להוריד מחיר",
+    "תוזיל",
+    "להוזיל",
+    "הנחה",
+    "פחות",
+    "תפחית",
+    "להפחית",
+)
+
 
 @dataclass
 class ParsedIntent:
@@ -58,8 +78,11 @@ class ProductCandidate:
 
 def _normalize_text(s: str) -> str:
     t = (s or "").lower().strip()
+    t = t.replace("₪", " שח ")
     for k, v in _HE_NUM_WORDS.items():
         t = re.sub(rf"\b{k}\b", v, t)
+    for pat, rep in _SEMANTIC_REWRITES:
+        t = re.sub(pat, rep, t)
     t = re.sub(r'["\'`׳״]', " ", t)
     t = re.sub(r"[^a-z0-9א-ת\s\-]", " ", t)
     t = re.sub(r"\s+", " ", t).strip()
@@ -78,17 +101,17 @@ def parse_intent_rule_based(message: str) -> ParsedIntent:
     has_reduce_words = any(k in txt for k in ("תוריד", "להוריד", "הוצא"))
     if action == "unknown" and has_stock_words and has_reduce_words:
         action = "out_of_stock"
-    if action == "unknown" and any(k in txt for k in ("תוריד את המחיר", "הורד מחיר", "להוריד מחיר", "פחות")):
+    if action == "unknown" and any(k in txt for k in _REDUCE_KEYWORDS):
         action = "reduce_price"
     if action == "reduce_price" and any(k in txt for k in ("כל ", "קטגור", "רשימה", "כמה מוצרים", "מוצרים:")):
         action = "bulk_reduce_price"
 
     delta: float | None = None
-    nums = re.findall(r"(\d+(?:[.,]\d+)?)\s*(?:שח|ש\"ח|₪|nis|ils)?", txt)
+    nums = re.findall(r"[-+]?\d+(?:[.,]\d+)?", txt)
     if action in ("reduce_price", "bulk_reduce_price") and nums:
         try:
             # Usually the last number in Hebrew command is the requested delta.
-            delta = float(nums[-1].replace(",", "."))
+            delta = abs(float(nums[-1].replace(",", ".")))
         except ValueError:
             delta = None
 
@@ -237,7 +260,22 @@ def rank_product_candidates(query: str, products: list[Product], *, top_k: int =
         contains_bonus = 0.0
         if q in n:
             contains_bonus = 0.2
-        score = (0.65 * seq) + (0.25 * token_overlap) + contains_bonus
+        fuzzy_token = 0.0
+        if q_tokens and n_tokens:
+            token_scores: list[float] = []
+            for qt in q_tokens:
+                best = 0.0
+                for nt in n_tokens:
+                    if qt == nt:
+                        best = 1.0
+                        break
+                    if qt in nt or nt in qt:
+                        best = max(best, 0.9)
+                        continue
+                    best = max(best, SequenceMatcher(a=qt, b=nt).ratio())
+                token_scores.append(best)
+            fuzzy_token = sum(token_scores) / max(1.0, float(len(token_scores)))
+        score = (0.50 * seq) + (0.20 * token_overlap) + (0.20 * fuzzy_token) + contains_bonus
         out.append(
             ProductCandidate(
                 product_id=p.id or 0,

@@ -11,6 +11,11 @@ class TestAiOps(unittest.TestCase):
         self.assertEqual(intent.delta_amount, 50.0)
         self.assertIn("4", intent.product_query)
 
+    def test_parse_price_reduction_without_preposition(self) -> None:
+        intent = parse_intent_rule_based('תוזיל את סנטיאגו 4 מושבים 50 ש"ח')
+        self.assertEqual(intent.action, "reduce_price")
+        self.assertEqual(intent.delta_amount, 50.0)
+
     def test_parse_stock_command(self) -> None:
         intent = parse_intent_rule_based("תוריד את בורדו 4 מושבים מהמלאי")
         self.assertEqual(intent.action, "out_of_stock")
@@ -30,6 +35,15 @@ class TestAiOps(unittest.TestCase):
         ranked = rank_product_candidates("בורדו ארבעה מושבים", products)
         self.assertGreater(len(ranked), 0)
         self.assertEqual(ranked[0].product_id, 1)
+
+    def test_rank_candidates_understands_semantic_aliases(self) -> None:
+        products = [
+            Product(id=10, shop_id=1, name="מערכת ישיבה ספרד 4 מושבים", regular_price=4200),
+            Product(id=11, shop_id=1, name="פינת אוכל ספרד", regular_price=2100),
+        ]
+        ranked = rank_product_candidates("פינת ישיבה ספרד", products)
+        self.assertGreater(len(ranked), 0)
+        self.assertEqual(ranked[0].product_id, 10)
 
 
 if __name__ == "__main__":
