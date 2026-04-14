@@ -252,6 +252,9 @@ class UserShopPreferencesOut(BaseModel):
     notify_price_change: bool
     notify_auto_pricing: bool
     notify_sanity: bool
+    notify_sale_live: bool
+    notify_sales_daily: bool
+    notify_sales_monthly: bool
 
 
 class UserShopPreferencesPatch(BaseModel):
@@ -259,6 +262,9 @@ class UserShopPreferencesPatch(BaseModel):
     notify_price_change: bool | None = None
     notify_auto_pricing: bool | None = None
     notify_sanity: bool | None = None
+    notify_sale_live: bool | None = None
+    notify_sales_daily: bool | None = None
+    notify_sales_monthly: bool | None = None
 
 
 class RecommendationsDismissIn(BaseModel):
@@ -1723,6 +1729,9 @@ def get_notification_preferences(
         notify_price_change=p.notify_price_change,
         notify_auto_pricing=p.notify_auto_pricing,
         notify_sanity=p.notify_sanity,
+        notify_sale_live=bool(getattr(p, "notify_sale_live", False)),
+        notify_sales_daily=bool(getattr(p, "notify_sales_daily", False)),
+        notify_sales_monthly=bool(getattr(p, "notify_sales_monthly", False)),
     )
 
 
@@ -1743,6 +1752,12 @@ def patch_notification_preferences(
         p.notify_auto_pricing = body.notify_auto_pricing
     if body.notify_sanity is not None:
         p.notify_sanity = body.notify_sanity
+    if body.notify_sale_live is not None:
+        p.notify_sale_live = body.notify_sale_live
+    if body.notify_sales_daily is not None:
+        p.notify_sales_daily = body.notify_sales_daily
+    if body.notify_sales_monthly is not None:
+        p.notify_sales_monthly = body.notify_sales_monthly
     p.updated_at = utcnow()
     session.add(p)
     session.commit()
@@ -1752,6 +1767,9 @@ def patch_notification_preferences(
         notify_price_change=p.notify_price_change,
         notify_auto_pricing=p.notify_auto_pricing,
         notify_sanity=p.notify_sanity,
+        notify_sale_live=bool(getattr(p, "notify_sale_live", False)),
+        notify_sales_daily=bool(getattr(p, "notify_sales_daily", False)),
+        notify_sales_monthly=bool(getattr(p, "notify_sales_monthly", False)),
     )
 
 

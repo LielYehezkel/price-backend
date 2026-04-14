@@ -61,6 +61,9 @@ class UserShopPreferences(SQLModel, table=True):
     notify_price_change: bool = Field(default=True)
     notify_auto_pricing: bool = Field(default=True)
     notify_sanity: bool = Field(default=True)
+    notify_sale_live: bool = Field(default=False)
+    notify_sales_daily: bool = Field(default=False)
+    notify_sales_monthly: bool = Field(default=False)
     dismissed_recommendation_ids_json: str = Field(default="[]")
     updated_at: datetime = Field(default_factory=utcnow)
 
@@ -342,7 +345,9 @@ class ShopWhatsappConfig(SQLModel, table=True):
     business_account_id: Optional[str] = None
     verify_token: Optional[str] = None
     access_token: Optional[str] = None
+    alert_phone_e164: Optional[str] = None
     webhook_path_secret: Optional[str] = None
+    sales_webhook_secret: Optional[str] = None
     created_by_user_id: Optional[int] = Field(default=None, foreign_key="user.id")
     updated_by_user_id: Optional[int] = Field(default=None, foreign_key="user.id")
     updated_at: datetime = Field(default_factory=utcnow)
@@ -358,3 +363,15 @@ class ShopWhatsappPendingAction(SQLModel, table=True):
     pending_question: str = ""
     created_at: datetime = Field(default_factory=utcnow, index=True)
     expires_at: datetime = Field(default_factory=utcnow, index=True)
+
+
+class ShopSalesNotificationLog(SQLModel, table=True):
+    """Tracks sent sales notifications to prevent duplicates."""
+
+    __table_args__ = (UniqueConstraint("shop_id", "event_kind", "event_key", name="uq_shop_sales_notify_event"),)
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    shop_id: int = Field(foreign_key="shop.id", index=True)
+    event_kind: str = Field(index=True)  # sale_live | daily_report | monthly_report
+    event_key: str = Field(index=True)  # order_id or YYYY-MM-DD or YYYY-MM
+    sent_at: datetime = Field(default_factory=utcnow, index=True)

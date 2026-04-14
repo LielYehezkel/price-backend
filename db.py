@@ -305,7 +305,9 @@ def _migrate_shop_whatsapp_config() -> None:
         ("business_account_id", "ALTER TABLE shopwhatsappconfig ADD COLUMN business_account_id VARCHAR"),
         ("verify_token", "ALTER TABLE shopwhatsappconfig ADD COLUMN verify_token VARCHAR"),
         ("access_token", "ALTER TABLE shopwhatsappconfig ADD COLUMN access_token VARCHAR"),
+        ("alert_phone_e164", "ALTER TABLE shopwhatsappconfig ADD COLUMN alert_phone_e164 VARCHAR"),
         ("webhook_path_secret", "ALTER TABLE shopwhatsappconfig ADD COLUMN webhook_path_secret VARCHAR"),
+        ("sales_webhook_secret", "ALTER TABLE shopwhatsappconfig ADD COLUMN sales_webhook_secret VARCHAR"),
         (
             "created_by_user_id",
             'ALTER TABLE shopwhatsappconfig ADD COLUMN created_by_user_id INTEGER REFERENCES "user"(id)',
@@ -327,6 +329,23 @@ def _migrate_shop_whatsapp_config() -> None:
                         log.warning("Migration failed: shopwhatsappconfig: %s", ex)
 
 
+def _migrate_user_shop_preferences_sales_notifications() -> None:
+    cols = [
+        ("notify_sale_live", "INTEGER DEFAULT 0"),
+        ("notify_sales_daily", "INTEGER DEFAULT 0"),
+        ("notify_sales_monthly", "INTEGER DEFAULT 0"),
+    ]
+    for name, typ in cols:
+        with engine.begin() as conn:
+            try:
+                conn.execute(text(f"ALTER TABLE usershoppreferences ADD COLUMN {name} {typ}"))
+            except Exception as ex:
+                if not _is_duplicate_column_error(ex):
+                    msg = str(ex).lower()
+                    if "no such table" not in msg and "does not exist" not in msg:
+                        log.warning("Migration failed: usershoppreferences.%s: %s", name, ex)
+
+
 def init_db() -> None:
     # Ensure all SQLModel tables are registered on metadata before create_all
     from backend import models as _models  # noqa: F401
@@ -346,6 +365,7 @@ def init_db() -> None:
     _ensure_admin_system_config_row()
     _migrate_shop_ai_action_log()
     _migrate_shop_whatsapp_config()
+    _migrate_user_shop_preferences_sales_notifications()
     _migrate_competitor_link_light_html_hash()
     _migrate_domain_price_selector_fetch_strategy()
     _backfill_tracked_competitors()

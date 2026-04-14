@@ -34,6 +34,9 @@ def alert_allowed_by_prefs(alert: Alert, prefs: UserShopPreferences) -> bool:
         "price_change": "notify_price_change",
         "auto_pricing": "notify_auto_pricing",
         "sanity_failed": "notify_sanity",
+        "sales_live": "notify_sale_live",
+        "sales_daily": "notify_sales_daily",
+        "sales_monthly": "notify_sales_monthly",
     }
     attr = key_map.get(k)
     if not attr:

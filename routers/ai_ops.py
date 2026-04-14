@@ -36,6 +36,7 @@ from backend.services.whatsapp_cloud import (
     send_test_text_message,
     validate_phone_number_id,
 )
+from backend.services.sales_notifications import handle_woo_sale_event
 
 router = APIRouter(prefix="/api/shops", tags=["ai-ops"])
 log = logging.getLogger(__name__)
@@ -1088,6 +1089,7 @@ class WhatsappConfigIn(BaseModel):
     business_account_id: str | None = None
     verify_token: str
     access_token: str
+    alert_phone_e164: str | None = None
 
 
 class WhatsappConfigOut(BaseModel):
@@ -1096,8 +1098,10 @@ class WhatsappConfigOut(BaseModel):
     business_account_id: str | None
     verify_token: str | None
     access_token_masked: str | None
+    alert_phone_e164: str | None
     webhook_url: str | None
     webhook_verify_url: str | None
+    sales_webhook_url: str | None
     updated_at: str | None
 
 
@@ -1114,14 +1118,20 @@ def _public_api_base() -> str:
     return (settings.public_api_base or "").strip().rstrip("/")
 
 
-def _webhook_urls(cfg: ShopWhatsappConfig | None) -> tuple[str | None, str | None]:
+def _webhook_urls(cfg: ShopWhatsappConfig | None) -> tuple[str | None, str | None, str | None]:
     if cfg is None or not cfg.webhook_path_secret:
-        return None, None
+        return None, None, None
     base = _public_api_base()
     if not base:
-        return None, None
+        return None, None, None
     path = f"/api/shops/ai/whatsapp/webhook/{cfg.webhook_path_secret}"
-    return f"{base}{path}", f"{base}{path}?hub.mode=subscribe&hub.verify_token=YOUR_VERIFY_TOKEN&hub.challenge=1234"
+    sales_secret = (cfg.sales_webhook_secret or cfg.webhook_path_secret or "").strip()
+    sales_url = f"{base}/api/shops/ai/whatsapp/sales-webhook/{sales_secret}" if sales_secret else None
+    return (
+        f"{base}{path}",
+        f"{base}{path}?hub.mode=subscribe&hub.verify_token=YOUR_VERIFY_TOKEN&hub.challenge=1234",
+        sales_url,
+    )
 
 
 @router.get("/{shop_id}/ai/whatsapp/config", response_model=WhatsappConfigOut)
@@ -1132,15 +1142,17 @@ def get_whatsapp_config(
 ) -> WhatsappConfigOut:
     require_shop_access(session, user, shop_id)
     cfg = session.exec(select(ShopWhatsappConfig).where(ShopWhatsappConfig.shop_id == shop_id)).first()
-    wh, wh_verify = _webhook_urls(cfg)
+    wh, wh_verify, sales_wh = _webhook_urls(cfg)
     return WhatsappConfigOut(
         enabled=bool(cfg.enabled) if cfg else False,
         phone_number_id=cfg.phone_number_id if cfg else None,
         business_account_id=cfg.business_account_id if cfg else None,
         verify_token=cfg.verify_token if cfg else None,
         access_token_masked=_mask_token(cfg.access_token if cfg else None),
+        alert_phone_e164=cfg.alert_phone_e164 if cfg else None,
         webhook_url=wh,
         webhook_verify_url=wh_verify,
+        sales_webhook_url=sales_wh,
         updated_at=cfg.updated_at.isoformat() if cfg and cfg.updated_at else None,
     )
 
@@ -1165,20 +1177,25 @@ def upsert_whatsapp_config(
     cfg.business_account_id = (body.business_account_id or "").strip() or None
     cfg.verify_token = (body.verify_token or "").strip() or None
     cfg.access_token = (body.access_token or "").strip() or None
+    cfg.alert_phone_e164 = (body.alert_phone_e164 or "").strip() or None
+    if not (cfg.sales_webhook_secret or "").strip():
+        cfg.sales_webhook_secret = secrets.token_urlsafe(24)
     cfg.updated_by_user_id = user.id
     cfg.updated_at = utcnow()
     session.add(cfg)
     session.commit()
     session.refresh(cfg)
-    wh, wh_verify = _webhook_urls(cfg)
+    wh, wh_verify, sales_wh = _webhook_urls(cfg)
     return WhatsappConfigOut(
         enabled=cfg.enabled,
         phone_number_id=cfg.phone_number_id,
         business_account_id=cfg.business_account_id,
         verify_token=cfg.verify_token,
         access_token_masked=_mask_token(cfg.access_token),
+        alert_phone_e164=cfg.alert_phone_e164,
         webhook_url=wh,
         webhook_verify_url=wh_verify,
+        sales_webhook_url=sales_wh,
         updated_at=cfg.updated_at.isoformat() if cfg.updated_at else None,
     )
 
@@ -1220,6 +1237,7 @@ class WhatsappWizardOut(BaseModel):
     current_step_key: str
     steps: list[WizardStepOut]
     webhook_url: str | None
+    sales_webhook_url: str | None
     verify_token: str | None
     blocking_issues: list[str] = []
 
@@ -1232,7 +1250,7 @@ def whatsapp_guide(
 ) -> WhatsappGuideOut:
     require_shop_access(session, user, shop_id)
     cfg = session.exec(select(ShopWhatsappConfig).where(ShopWhatsappConfig.shop_id == shop_id)).first()
-    wh, _ = _webhook_urls(cfg)
+    wh, _, sales_wh = _webhook_urls(cfg)
     verify = cfg.verify_token if cfg else None
     return WhatsappGuideOut(
         title="חיבור בוט החנות ל-WhatsApp Cloud API",
@@ -1313,7 +1331,7 @@ def whatsapp_wizard(
 ) -> WhatsappWizardOut:
     require_shop_access(session, user, shop_id)
     cfg = session.exec(select(ShopWhatsappConfig).where(ShopWhatsappConfig.shop_id == shop_id)).first()
-    wh, _ = _webhook_urls(cfg)
+    wh, _, _ = _webhook_urls(cfg)
     has_cfg = cfg is not None
     has_ids = has_cfg and bool((cfg.phone_number_id or "").strip()) and bool((cfg.verify_token or "").strip())
     has_token = has_cfg and bool((cfg.access_token or "").strip())
@@ -1371,6 +1389,7 @@ def whatsapp_wizard(
         current_step_key=current,
         steps=steps,
         webhook_url=wh,
+        sales_webhook_url=sales_wh,
         verify_token=cfg.verify_token if cfg else None,
         blocking_issues=blocking_issues,
     )
@@ -1446,6 +1465,26 @@ async def whatsapp_webhook_receive(
             log.exception("whatsapp webhook message processing failed shop_id=%s sender=%s", cfg.shop_id, sender)
             _send_whatsapp_reply(cfg, sender, f"שגיאה בביצוע הפעולה: {ex!s}")
     return {"ok": True, "shop_id": cfg.shop_id, "enabled": cfg.enabled, "handled_messages": handled}
+
+
+@router.post("/ai/whatsapp/sales-webhook/{secret}")
+async def whatsapp_sales_webhook_receive(
+    secret: str,
+    request: Request,
+    session: Annotated[Session, Depends(get_session)],
+):
+    cfg = session.exec(select(ShopWhatsappConfig).where(ShopWhatsappConfig.sales_webhook_secret == secret)).first()
+    if not cfg:
+        raise HTTPException(404, "Webhook not found")
+    payload = await request.json()
+    ok = False
+    try:
+        if isinstance(payload, dict):
+            # Woo usually posts single order payload.
+            ok = handle_woo_sale_event(session, cfg, payload)
+    except Exception:
+        log.exception("whatsapp sales webhook processing failed shop_id=%s", cfg.shop_id)
+    return {"ok": True, "processed": ok}
 
 
 def _extract_incoming_whatsapp_messages(payload: Any) -> list[dict[str, str]]:

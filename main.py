@@ -12,6 +12,7 @@ from backend.config import settings
 from backend.db import engine, init_db
 from backend.routers import admin, ai_ops, auth, integrations, plugin, price, shops
 from backend.services.monitor_checks import run_scheduled_checks
+from backend.services.sales_notifications import send_scheduled_sales_reports
 from backend.services.scan_engine_journal import record_tick_failure, record_tick_success
 from sqlmodel import Session
 
@@ -37,6 +38,14 @@ def _scheduled_job() -> None:
             log.exception("failed to record scheduler heartbeat failure")
 
 
+def _sales_reports_job() -> None:
+    try:
+        with Session(engine) as session:
+            send_scheduled_sales_reports(session)
+    except Exception:
+        log.exception("scheduled sales reports job failed")
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     init_db()
@@ -46,6 +55,15 @@ async def lifespan(_app: FastAPI):
             "interval",
             seconds=5,
             id="price_checks",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+        )
+        scheduler.add_job(
+            _sales_reports_job,
+            "interval",
+            minutes=1,
+            id="sales_reports",
             replace_existing=True,
             max_instances=1,
             coalesce=True,
